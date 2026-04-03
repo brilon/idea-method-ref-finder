@@ -108,11 +108,14 @@ class ReferenceFinderUtilTest {
 
     @Test
     void testSignatureConstructor() {
+        // 必须先创建 mock，不能嵌套在 thenReturn() 内（会触发 UnfinishedStubbingException）
+        PsiParameter intParam = mockParam("int");
+
         when(method.getContainingClass()).thenReturn(containingClass);
         when(containingClass.getQualifiedName()).thenReturn("com.example.Widget");
         when(method.getName()).thenReturn("Widget"); // 构造方法名与类名相同
         when(method.getParameterList()).thenReturn(parameterList);
-        when(parameterList.getParameters()).thenReturn(new PsiParameter[]{mockParam("int")});
+        when(parameterList.getParameters()).thenReturn(new PsiParameter[]{intParam});
 
         assertEquals("com.example.Widget#Widget(int)", ReferenceFinderUtil.getMethodSignature(method));
     }
