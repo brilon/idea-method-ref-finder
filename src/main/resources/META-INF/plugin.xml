@@ -31,5 +31,19 @@
                 description="查找该类全部方法在所有已打开项目中的调用引用，结果导出为 GBK 编码 CSV">
             <add-to-group group-id="EditorPopupMenu" anchor="last"/>
         </action>
+
+        <action id="com.example.plugin.FindMethodReferencesPreview"
+                class="com.example.plugin.action.FindMethodReferencesPreviewAction"
+                text="查找方法跨项目引用 (预览CSV)"
+                description="查找该方法在所有已打开项目中的调用引用，结果在 Tool Window 只读编辑器中预览">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+        </action>
+
+        <action id="com.example.plugin.FindClassMethodReferencesPreview"
+                class="com.example.plugin.action.FindClassMethodReferencesPreviewAction"
+                text="查找类所有方法跨项目引用 (预览CSV)"
+                description="查找该类全部方法在所有已打开项目中的调用引用，结果在 Tool Window 只读编辑器中预览">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+        </action>
     </actions>
 </idea-plugin>
