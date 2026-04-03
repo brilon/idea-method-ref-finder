@@ -33,7 +33,7 @@ tasks {
 
     patchPluginXml {
         sinceBuild.set("241")
-        untilBuild.set("251.*")
+        untilBuild.set("")
     }
 
     // Disable searchable options to speed up build
