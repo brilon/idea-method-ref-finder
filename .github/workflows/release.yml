@@ -1,0 +1,133 @@
+name: Release Plugin
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # 提交文件、创建 tag、发布 Release 均需要此权限
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # 使用 PAT 或默认 token push 回 main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Calculate new version
+        id: ver
+        run: |
+          CURRENT=$(grep -E '^version\s*=' build.gradle.kts | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          case "${{ inputs.bump }}" in
+            major) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR+1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH+1)) ;;
+          esac
+          NEW="$MAJOR.$MINOR.$PATCH"
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "new=$NEW"         >> "$GITHUB_OUTPUT"
+          echo "tag=v$NEW"        >> "$GITHUB_OUTPUT"
+          echo "版本升级：$CURRENT → $NEW (${{ inputs.bump }})"
+
+      - name: Update version in source files
+        run: |
+          CURRENT="${{ steps.ver.outputs.current }}"
+          NEW="${{ steps.ver.outputs.new }}"
+          # build.gradle.kts
+          sed -i -E "s/^version[[:space:]]*=[[:space:]]*\"$CURRENT\"/version = \"$NEW\"/" build.gradle.kts
+          # plugin.xml
+          sed -i "s|<version>$CURRENT</version>|<version>$NEW</version>|" \
+            src/main/resources/META-INF/plugin.xml
+          # 打印确认
+          grep '^version' build.gradle.kts
+          grep '<version>' src/main/resources/META-INF/plugin.xml
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Build plugin
+        run: |
+          chmod +x gradlew
+          ./gradlew buildPlugin --no-daemon
+
+      - name: Commit, tag and push
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add build.gradle.kts src/main/resources/META-INF/plugin.xml
+          git commit -m "chore: bump version to ${{ steps.ver.outputs.tag }}"
+          git tag "${{ steps.ver.outputs.tag }}"
+          git push origin main --tags
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          files: build/distributions/*.zip
+          generate_release_notes: true
+
+      - name: Update updatePlugins.xml
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          VERSION="${{ steps.ver.outputs.new }}"
+          REPO="${{ github.repository }}"
+          ZIP_URL="https://github.com/${REPO}/releases/download/${TAG}/idea-method-ref-finder-${VERSION}.zip"
+
+          XML=$(cat <<XMLEOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!--
+            IntelliJ IDEA 自定义插件仓库描述文件。
+            此文件由 GitHub Actions 在每次发布 Release 时自动更新。
+
+            在 IDEA 中添加仓库：
+            Settings → Plugins → ⚙️ → Manage Plugin Repositories
+            → 填入以下 URL：
+            https://raw.githubusercontent.com/${REPO}/main/updatePlugins.xml
+          -->
+          <plugins>
+            <plugin
+              id="com.example.method-ref-finder"
+              url="${ZIP_URL}"
+              version="${VERSION}"/>
+          </plugins>
+          XMLEOF
+          )
+
+          ENCODED=$(echo "$XML" | base64 -w 0)
+          FILE_SHA=$(gh api "repos/${REPO}/contents/updatePlugins.xml" --jq '.sha' 2>/dev/null || echo "")
+
+          if [ -n "$FILE_SHA" ]; then
+            gh api "repos/${REPO}/contents/updatePlugins.xml" \
+              --method PUT \
+              --field message="chore: update updatePlugins.xml → ${TAG}" \
+              --field content="$ENCODED" \
+              --field sha="$FILE_SHA" \
+              --field branch="main"
+          else
+            gh api "repos/${REPO}/contents/updatePlugins.xml" \
+              --method PUT \
+              --field message="chore: update updatePlugins.xml → ${TAG}" \
+              --field content="$ENCODED" \
+              --field branch="main"
+          fi
+
+          echo "updatePlugins.xml 已更新，指向 ${ZIP_URL}"
