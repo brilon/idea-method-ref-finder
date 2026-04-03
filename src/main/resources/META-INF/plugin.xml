@@ -1,0 +1,35 @@
+<idea-plugin>
+    <id>com.example.method-ref-finder</id>
+    <name>Cross-Project Method Reference Finder</name>
+    <version>1.0.0</version>
+    <vendor email="dev@example.com">Example</vendor>
+
+    <description><![CDATA[
+        <p>在 Java 类/方法上右键，查找该方法（或类的所有方法）在所有已打开项目中的引用，导出 CSV（GBK 编码）。</p>
+        <ul>
+            <li><b>查找方法跨项目引用</b>：在方法上右键，导出该方法的所有引用到 CSV。</li>
+            <li><b>查找类所有方法跨项目引用</b>：在类上右键，批量导出类中所有方法的引用到 CSV。</li>
+        </ul>
+        <p>CSV 列：源方法、目标项目、引用方法，格式如
+        <code>com.example.Foo#bar(java.lang.String)</code>。</p>
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.modules.java</depends>
+
+    <actions>
+        <action id="com.example.plugin.FindMethodReferences"
+                class="com.example.plugin.action.FindMethodReferencesAction"
+                text="查找方法跨项目引用 (导出CSV)"
+                description="查找该方法在所有已打开项目中的调用引用，结果导出为 GBK 编码 CSV">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+        </action>
+
+        <action id="com.example.plugin.FindClassMethodReferences"
+                class="com.example.plugin.action.FindClassMethodReferencesAction"
+                text="查找类所有方法跨项目引用 (导出CSV)"
+                description="查找该类全部方法在所有已打开项目中的调用引用，结果导出为 GBK 编码 CSV">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>
