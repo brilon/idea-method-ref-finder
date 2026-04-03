@@ -2,9 +2,11 @@ package com.example.plugin.action;
 
 import com.example.plugin.util.CsvExporter;
 import com.example.plugin.util.ReferenceFinderUtil;
+import com.intellij.openapi.actionSystem.ActionUpdateThread;
 import com.intellij.openapi.actionSystem.AnAction;
 import com.intellij.openapi.actionSystem.AnActionEvent;
 import com.intellij.openapi.actionSystem.CommonDataKeys;
+import com.intellij.openapi.application.ReadAction;
 import com.intellij.openapi.editor.Editor;
 import com.intellij.openapi.progress.ProgressManager;
 import com.intellij.openapi.ui.Messages;
@@ -24,27 +26,38 @@ import java.util.List;
  */
 public class FindClassMethodReferencesAction extends AnAction {
 
+    /**
+     * 声明 update() 在后台线程执行（IDEA 2022.3+ 要求）。
+     * PSI 访问需包裹在 ReadAction 内。
+     */
+    @Override
+    public @NotNull ActionUpdateThread getActionUpdateThread() {
+        return ActionUpdateThread.BGT;
+    }
+
     @Override
     public void update(@NotNull AnActionEvent e) {
-        PsiClass psiClass = getTargetClass(e);
-        // 有类且类中存在至少一个方法时才显示
-        e.getPresentation().setEnabledAndVisible(
-                psiClass != null && psiClass.getMethods().length > 0);
+        boolean visible = ReadAction.compute(() -> {
+            PsiClass psiClass = getTargetClass(e);
+            // 有类且包含至少一个方法时才显示
+            return psiClass != null && psiClass.getMethods().length > 0;
+        });
+        e.getPresentation().setEnabledAndVisible(visible);
     }
 
     @Override
     public void actionPerformed(@NotNull AnActionEvent e) {
-        PsiClass psiClass = getTargetClass(e);
+        PsiClass psiClass = ReadAction.compute(() -> getTargetClass(e));
         if (psiClass == null) return;
 
-        List<PsiMethod> methods = Arrays.asList(psiClass.getMethods());
+        List<PsiMethod> methods = ReadAction.compute(() -> Arrays.asList(psiClass.getMethods()));
         if (methods.isEmpty()) {
             Messages.showInfoMessage(e.getProject(), "该类没有方法，无需查找。", "提示");
             return;
         }
 
-        String className = psiClass.getQualifiedName() != null
-                ? psiClass.getQualifiedName() : psiClass.getName();
+        String className = ReadAction.compute(() ->
+                psiClass.getQualifiedName() != null ? psiClass.getQualifiedName() : psiClass.getName());
 
         List<String[]> results = new ArrayList<>();
 
@@ -74,7 +87,6 @@ public class FindClassMethodReferencesAction extends AnAction {
         // 优先取最近的具名类（非匿名类）
         PsiClass psiClass = PsiTreeUtil.getParentOfType(element, PsiClass.class, false);
         if (psiClass instanceof PsiAnonymousClass) {
-            // 若光标在匿名类中，取外层具名类
             psiClass = PsiTreeUtil.getParentOfType(psiClass, PsiClass.class, true);
         }
         return psiClass;
