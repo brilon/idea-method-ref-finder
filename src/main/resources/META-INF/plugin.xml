@@ -1,7 +1,7 @@
 <idea-plugin>
     <id>com.example.method-ref-finder</id>
     <name>Cross-Project Method Reference Finder</name>
-    <version>1.1.0</version>
+    <version>1.4.0</version>
     <vendor email="dev@example.com">Example</vendor>
 
     <description><![CDATA[
