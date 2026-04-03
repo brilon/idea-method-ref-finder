@@ -10,6 +10,11 @@ repositories {
     mavenCentral()
 }
 
+dependencies {
+    testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+}
+
 intellij {
     version.set("2024.1.7")
     type.set("IC")
@@ -32,5 +37,9 @@ tasks {
     // Disable searchable options to speed up build
     buildSearchableOptions {
         enabled = false
+    }
+
+    test {
+        useJUnitPlatform()
     }
 }
