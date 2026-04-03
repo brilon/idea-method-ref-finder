@@ -23,7 +23,7 @@ class ReferenceFinderUtilTest extends LightJavaCodeInsightFixtureTestCase5 {
 
     @Test
     void testSignatureNoParams() {
-        PsiClass cls = myFixture.addClass(
+        PsiClass cls = getFixture().addClass(
                 "package com.example;\n" +
                 "public class Foo {\n" +
                 "    public void bar() {}\n" +
@@ -34,7 +34,7 @@ class ReferenceFinderUtilTest extends LightJavaCodeInsightFixtureTestCase5 {
 
     @Test
     void testSignatureWithPrimitiveParams() {
-        PsiClass cls = myFixture.addClass(
+        PsiClass cls = getFixture().addClass(
                 "package com.example;\n" +
                 "public class Calc {\n" +
                 "    public int add(int a, int b) { return a + b; }\n" +
@@ -45,7 +45,7 @@ class ReferenceFinderUtilTest extends LightJavaCodeInsightFixtureTestCase5 {
 
     @Test
     void testSignatureWithFullyQualifiedParams() {
-        PsiClass cls = myFixture.addClass(
+        PsiClass cls = getFixture().addClass(
                 "package com.example;\n" +
                 "public class Notifier {\n" +
                 "    public void send(java.lang.String to, java.lang.String body) {}\n" +
@@ -58,7 +58,7 @@ class ReferenceFinderUtilTest extends LightJavaCodeInsightFixtureTestCase5 {
 
     @Test
     void testSignatureConstructor() {
-        PsiClass cls = myFixture.addClass(
+        PsiClass cls = getFixture().addClass(
                 "package com.example;\n" +
                 "public class Widget {\n" +
                 "    public Widget(int id) {}\n" +
@@ -78,21 +78,21 @@ class ReferenceFinderUtilTest extends LightJavaCodeInsightFixtureTestCase5 {
     @Test
     void testFindReferences_findsCallerInSameProject() {
         // 被查找的目标方法
-        myFixture.addClass(
+        getFixture().addClass(
                 "package com.example;\n" +
                 "public class Greeter {\n" +
                 "    public String greet(String name) { return \"Hello \" + name; }\n" +
                 "}");
 
         // 调用方
-        myFixture.addClass(
+        getFixture().addClass(
                 "package com.example;\n" +
                 "public class App {\n" +
                 "    private Greeter g = new Greeter();\n" +
                 "    public void run() { g.greet(\"world\"); }\n" +
                 "}");
 
-        PsiClass greeterClass = myFixture.findClass("com.example.Greeter");
+        PsiClass greeterClass = getFixture().findClass("com.example.Greeter");
         assertNotNull(greeterClass);
         PsiMethod greetMethod = greeterClass.getMethods()[0];
 
@@ -108,13 +108,13 @@ class ReferenceFinderUtilTest extends LightJavaCodeInsightFixtureTestCase5 {
 
     @Test
     void testFindReferences_noReferences() {
-        myFixture.addClass(
+        getFixture().addClass(
                 "package com.example;\n" +
                 "public class Unused {\n" +
                 "    public void doNothing() {}\n" +
                 "}");
 
-        PsiClass cls = myFixture.findClass("com.example.Unused");
+        PsiClass cls = getFixture().findClass("com.example.Unused");
         assertNotNull(cls);
         PsiMethod method = cls.getMethods()[0];
 
@@ -124,27 +124,27 @@ class ReferenceFinderUtilTest extends LightJavaCodeInsightFixtureTestCase5 {
 
     @Test
     void testFindReferences_multipleCallers() {
-        myFixture.addClass(
+        getFixture().addClass(
                 "package com.example;\n" +
                 "public class Logger {\n" +
                 "    public void log(String msg) {}\n" +
                 "}");
 
-        myFixture.addClass(
+        getFixture().addClass(
                 "package com.example;\n" +
                 "public class ServiceA {\n" +
                 "    Logger logger = new Logger();\n" +
                 "    public void a() { logger.log(\"a\"); }\n" +
                 "}");
 
-        myFixture.addClass(
+        getFixture().addClass(
                 "package com.example;\n" +
                 "public class ServiceB {\n" +
                 "    Logger logger = new Logger();\n" +
                 "    public void b() { logger.log(\"b\"); }\n" +
                 "}");
 
-        PsiClass loggerClass = myFixture.findClass("com.example.Logger");
+        PsiClass loggerClass = getFixture().findClass("com.example.Logger");
         assertNotNull(loggerClass);
         PsiMethod logMethod = loggerClass.getMethods()[0];
 
@@ -154,14 +154,14 @@ class ReferenceFinderUtilTest extends LightJavaCodeInsightFixtureTestCase5 {
 
     @Test
     void testFindReferences_classAllMethods() {
-        myFixture.addClass(
+        getFixture().addClass(
                 "package com.example;\n" +
                 "public class MathUtils {\n" +
                 "    public int add(int a, int b) { return a + b; }\n" +
                 "    public int sub(int a, int b) { return a - b; }\n" +
                 "}");
 
-        myFixture.addClass(
+        getFixture().addClass(
                 "package com.example;\n" +
                 "public class Calculator {\n" +
                 "    MathUtils m = new MathUtils();\n" +
@@ -171,7 +171,7 @@ class ReferenceFinderUtilTest extends LightJavaCodeInsightFixtureTestCase5 {
                 "    }\n" +
                 "}");
 
-        PsiClass mathClass = myFixture.findClass("com.example.MathUtils");
+        PsiClass mathClass = getFixture().findClass("com.example.MathUtils");
         assertNotNull(mathClass);
         List<PsiMethod> methods = Arrays.asList(mathClass.getMethods());
 
