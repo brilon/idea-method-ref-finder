@@ -55,7 +55,7 @@ class CsvExporterTest {
     @Test
     void testSingleRowWrittenCorrectly(@TempDir Path tmpDir) throws IOException {
         File out = tmpDir.resolve("single.csv").toFile();
-        List<String[]> rows = List.of(
+        List<String[]> rows = List.<String[]>of(
                 new String[]{"com.example.Foo#bar(java.lang.String)", "my-project", "com.example.App#run()"});
         writeToFile(rows, out);
 
@@ -69,7 +69,7 @@ class CsvExporterTest {
     void testCsvEscapingForCommaInValue(@TempDir Path tmpDir) throws IOException {
         File out = tmpDir.resolve("escape.csv").toFile();
         // 方法名里含逗号（极端场景）
-        List<String[]> rows = List.of(
+        List<String[]> rows = List.<String[]>of(
                 new String[]{"com.example.Foo#bar(int, long)", "proj,x", "com.example.App#go()"});
         writeToFile(rows, out);
 
@@ -82,7 +82,7 @@ class CsvExporterTest {
     @Test
     void testOutputIsGbkEncoded(@TempDir Path tmpDir) throws IOException {
         File out = tmpDir.resolve("gbk.csv").toFile();
-        List<String[]> rows = List.of(
+        List<String[]> rows = List.<String[]>of(
                 new String[]{"com.example.Foo#bar()", "示例项目", "com.example.App#run()"});
         writeToFile(rows, out);
 
