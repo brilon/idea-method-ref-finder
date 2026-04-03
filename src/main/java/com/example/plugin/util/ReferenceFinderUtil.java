@@ -1,6 +1,8 @@
 package com.example.plugin.util;
 
 import com.intellij.openapi.application.ReadAction;
+import com.intellij.openapi.module.Module;
+import com.intellij.openapi.module.ModuleUtilCore;
 import com.intellij.openapi.progress.ProgressIndicator;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.project.ProjectManager;
@@ -19,6 +21,7 @@ import java.util.List;
  * <ol>
  *   <li>源方法 — 被查找的方法签名，格式 {@code com.example.Foo#bar(java.lang.String)}</li>
  *   <li>目标项目 — 发现引用所在的 IntelliJ 项目名称</li>
+ *   <li>目标模块 — 发现引用所在的 Maven/Gradle 模块名称</li>
  *   <li>引用方法 — 调用方的方法签名（若调用在初始化块/字段中则为文件名）</li>
  * </ol>
  *
@@ -62,7 +65,7 @@ public class ReferenceFinderUtil {
      *
      * @param methods   要查找引用的方法列表
      * @param indicator 进度指示器，可为 null
-     * @return 每条记录为 String[3]：{源方法签名, 目标项目名, 引用方法签名}
+     * @return 每条记录为 String[4]：{源方法签名, 目标项目名, 目标模块名, 引用方法签名}
      */
     public static List<String[]> findReferences(List<PsiMethod> methods, ProgressIndicator indicator) {
         List<String[]> results = new ArrayList<>();
@@ -106,19 +109,27 @@ public class ReferenceFinderUtil {
                         .forEach(reference -> {
                             if (indicator != null && indicator.isCanceled()) return false;
 
-                            // 读取引用元信息（需 ReadAction）
-                            String callerSignature = ReadAction.compute(() -> {
+                            // 读取引用元信息：模块名 + 调用方签名（均需 ReadAction）
+                            String[] refInfo = ReadAction.compute(() -> {
                                 PsiElement refElement = reference.getElement();
+
+                                Module module = ModuleUtilCore.findModuleForPsiElement(refElement);
+                                String moduleName = module != null ? module.getName() : "";
+
                                 PsiMethod callerMethod = PsiTreeUtil.getParentOfType(
                                         refElement, PsiMethod.class);
+                                String callerSignature;
                                 if (callerMethod != null) {
-                                    return getMethodSignature(callerMethod);
+                                    callerSignature = getMethodSignature(callerMethod);
+                                } else {
+                                    PsiFile file = refElement.getContainingFile();
+                                    callerSignature = file != null ? file.getName() : "(unknown)";
                                 }
-                                PsiFile file = refElement.getContainingFile();
-                                return file != null ? file.getName() : "(unknown)";
+                                return new String[]{moduleName, callerSignature};
                             });
 
-                            results.add(new String[]{sourceSignature, projectName, callerSignature});
+                            results.add(new String[]{
+                                    sourceSignature, projectName, refInfo[0], refInfo[1]});
                             return true;
                         });
             }

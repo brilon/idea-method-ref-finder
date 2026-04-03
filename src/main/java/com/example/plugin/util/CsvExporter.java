@@ -15,10 +15,10 @@ import java.util.List;
 public class CsvExporter {
 
     private static final Charset GBK = Charset.forName("GBK");
-    private static final String HEADER = "源方法,目标项目,引用方法\n";
+    private static final String HEADER = "源方法,目标项目,目标模块,引用方法\n";
 
     /**
-     * @param results    引用结果列表，每条为 String[3]：{源方法, 目标项目, 引用方法}
+     * @param results    引用结果列表，每条为 String[4]：{源方法, 目标项目, 目标模块, 引用方法}
      * @param filePrefix 文件名前缀，如 "method-refs" 或 "class-refs"
      * @param project    当前 IntelliJ 项目（用于显示弹窗）
      */
@@ -32,7 +32,8 @@ public class CsvExporter {
             for (String[] row : results) {
                 writer.write(escapeCsv(row[0]) + ","
                         + escapeCsv(row[1]) + ","
-                        + escapeCsv(row[2]) + "\n");
+                        + escapeCsv(row[2]) + ","
+                        + escapeCsv(row[3]) + "\n");
             }
             Messages.showInfoMessage(project,
                     "共找到 " + results.size() + " 条引用，已导出至：\n" + filePath,
