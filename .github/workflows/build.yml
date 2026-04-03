@@ -3,6 +3,8 @@ name: Build & Package Plugin
 on:
   push:
     branches: [ "main" ]
+    tags:
+      - 'v*'          # 推送 v1.0.0 / v1.2.3 等 tag 时触发 release job
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
