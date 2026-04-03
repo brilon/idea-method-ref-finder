@@ -5,11 +5,10 @@ import com.intellij.openapi.editor.Editor;
 import com.intellij.openapi.editor.EditorFactory;
 import com.intellij.openapi.fileTypes.PlainTextFileType;
 import com.intellij.openapi.project.Project;
+import com.intellij.icons.AllIcons;
 import com.intellij.openapi.wm.RegisterToolWindowTask;
 import com.intellij.openapi.wm.ToolWindow;
 import com.intellij.openapi.wm.ToolWindowManager;
-
-import javax.swing.Icon;
 import com.intellij.ui.content.Content;
 import com.intellij.ui.content.ContentFactory;
 import com.intellij.ui.content.ContentManager;
@@ -38,7 +37,7 @@ public class CsvPreviewUtil {
         ToolWindowManager twm = ToolWindowManager.getInstance(project);
         ToolWindow toolWindow = twm.getToolWindow(TOOL_WINDOW_ID);
         if (toolWindow == null) {
-            toolWindow = twm.registerToolWindow(RegisterToolWindowTask.closable(TOOL_WINDOW_ID, (Icon) null));
+            toolWindow = twm.registerToolWindow(RegisterToolWindowTask.closable(TOOL_WINDOW_ID, AllIcons.Actions.Find));
         }
 
         ContentManager contentManager = toolWindow.getContentManager();
