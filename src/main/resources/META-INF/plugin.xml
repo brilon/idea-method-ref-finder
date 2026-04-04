@@ -45,31 +45,17 @@
                 description="查找该类全部方法在所有已打开项目中的调用引用，结果在 Tool Window 只读编辑器中预览">
             <add-to-group group-id="EditorPopupMenu" anchor="last"/>
         </action>
-        <action id="com.example.plugin.FindPackageClassReferences"
-                class="com.example.plugin.action.FindPackageClassReferencesAction"
-                text="查找包内所有类的引用 (导出CSV)"
-                description="查找包（含子包）内所有类在所有已打开项目中被引用的位置，结果导出为 GBK 编码 CSV">
+        <action id="com.example.plugin.FindPackageReferences"
+                class="com.example.plugin.action.FindPackageReferencesAction"
+                text="查找包内引用 (导出CSV)"
+                description="查找包（含子包）内所有类及其方法在所有已打开项目中被引用的位置，结果导出为 GBK 编码 CSV">
             <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
         </action>
 
-        <action id="com.example.plugin.FindPackageClassReferencesPreview"
-                class="com.example.plugin.action.FindPackageClassReferencesPreviewAction"
-                text="查找包内所有类的引用 (预览CSV)"
-                description="查找包（含子包）内所有类在所有已打开项目中被引用的位置，结果在 Tool Window 表格中预览">
-            <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
-        </action>
-
-        <action id="com.example.plugin.FindPackageMethodReferences"
-                class="com.example.plugin.action.FindPackageMethodReferencesAction"
-                text="查找包内所有类方法的引用 (导出CSV)"
-                description="查找包（含子包）内所有类的全部方法在所有已打开项目中被调用的位置，结果导出为 GBK 编码 CSV">
-            <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
-        </action>
-
-        <action id="com.example.plugin.FindPackageMethodReferencesPreview"
-                class="com.example.plugin.action.FindPackageMethodReferencesPreviewAction"
-                text="查找包内所有类方法的引用 (预览CSV)"
-                description="查找包（含子包）内所有类的全部方法在所有已打开项目中被调用的位置，结果在 Tool Window 表格中预览">
+        <action id="com.example.plugin.FindPackageReferencesPreview"
+                class="com.example.plugin.action.FindPackageReferencesPreviewAction"
+                text="查找包内引用 (预览CSV)"
+                description="查找包（含子包）内所有类及其方法在所有已打开项目中被引用的位置，结果在 Tool Window 表格中预览">
             <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
         </action>
     </actions>

@@ -1,29 +1,27 @@
 package com.example.plugin.action;
 
 import com.example.plugin.util.CsvExporter;
+import com.example.plugin.util.CsvPreviewUtil;
 import com.example.plugin.util.ReferenceFinderUtil;
 import com.intellij.openapi.actionSystem.ActionUpdateThread;
 import com.intellij.openapi.actionSystem.AnAction;
 import com.intellij.openapi.actionSystem.AnActionEvent;
-import com.intellij.openapi.actionSystem.CommonDataKeys;
 import com.intellij.openapi.application.ReadAction;
+import com.intellij.openapi.progress.ProgressIndicator;
 import com.intellij.openapi.progress.ProgressManager;
 import com.intellij.openapi.ui.Messages;
-import com.intellij.psi.PsiDirectory;
-import com.intellij.psi.PsiElement;
-import com.intellij.psi.PsiClass;
-import com.intellij.psi.PsiPackage;
-import com.intellij.psi.JavaDirectoryService;
+import com.intellij.psi.*;
 import org.jetbrains.annotations.NotNull;
-import org.jetbrains.annotations.Nullable;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 /**
- * 项目视图右键菜单：查找包内所有类被引用的位置，导出 CSV。
+ * 项目视图右键菜单：查找包内所有类及其方法被引用的位置，在 Tool Window 表格中预览。
+ * 同时包含类引用（类名被使用的位置）和方法引用（方法被调用的位置）。
  */
-public class FindPackageClassReferencesAction extends AnAction {
+public class FindPackageReferencesPreviewAction extends AnAction {
 
     @Override
     public @NotNull ActionUpdateThread getActionUpdateThread() {
@@ -33,7 +31,7 @@ public class FindPackageClassReferencesAction extends AnAction {
     @Override
     public void update(@NotNull AnActionEvent e) {
         boolean visible = ReadAction.compute(() -> {
-            PsiPackage pkg = getTargetPackage(e);
+            PsiPackage pkg = FindPackageReferencesAction.getTargetPackage(e);
             if (pkg == null) return false;
             return !ReferenceFinderUtil.collectPackageClasses(pkg, e.getProject()).isEmpty();
         });
@@ -42,7 +40,7 @@ public class FindPackageClassReferencesAction extends AnAction {
 
     @Override
     public void actionPerformed(@NotNull AnActionEvent e) {
-        PsiPackage pkg = ReadAction.compute(() -> getTargetPackage(e));
+        PsiPackage pkg = ReadAction.compute(() -> FindPackageReferencesAction.getTargetPackage(e));
         if (pkg == null) return;
 
         List<PsiClass> classes = ReadAction.compute(() ->
@@ -50,10 +48,16 @@ public class FindPackageClassReferencesAction extends AnAction {
         String pkgName = ReadAction.compute(pkg::getQualifiedName);
 
         List<String[]> results = new ArrayList<>();
-        boolean ok = ProgressManager.getInstance().runProcessWithProgressSynchronously(() ->
-                results.addAll(ReferenceFinderUtil.findClassReferences(
-                        classes, ProgressManager.getInstance().getProgressIndicator())),
-                "查找包内类引用：" + pkgName, true, e.getProject());
+        boolean ok = ProgressManager.getInstance().runProcessWithProgressSynchronously(() -> {
+            ProgressIndicator indicator = ProgressManager.getInstance().getProgressIndicator();
+            results.addAll(ReferenceFinderUtil.findClassReferences(classes, indicator));
+            List<PsiMethod> methods = ReadAction.compute(() -> {
+                List<PsiMethod> all = new ArrayList<>();
+                for (PsiClass cls : classes) all.addAll(Arrays.asList(cls.getMethods()));
+                return all;
+            });
+            results.addAll(ReferenceFinderUtil.findReferences(methods, indicator));
+        }, "查找包内引用：" + pkgName, true, e.getProject());
 
         if (!ok) {
             Messages.showInfoMessage(e.getProject(),
@@ -61,16 +65,7 @@ public class FindPackageClassReferencesAction extends AnAction {
             if (results.isEmpty()) return;
         }
 
-        CsvExporter.export(results, "pkg-class-refs",
-                "源类,目标项目,目标模块,引用位置\n", e.getProject());
-    }
-
-    @Nullable
-    private PsiPackage getTargetPackage(@NotNull AnActionEvent e) {
-        PsiElement element = e.getData(CommonDataKeys.PSI_ELEMENT);
-        if (element instanceof PsiPackage) return (PsiPackage) element;
-        if (element instanceof PsiDirectory)
-            return JavaDirectoryService.getInstance().getPackage((PsiDirectory) element);
-        return null;
+        String csv = CsvExporter.buildCsvString(results, FindPackageReferencesAction.HEADER);
+        CsvPreviewUtil.show(e.getProject(), csv, "pkg-refs (" + results.size() + " 条)");
     }
 }

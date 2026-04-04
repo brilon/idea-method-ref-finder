@@ -1,21 +1,16 @@
 package com.example.plugin.action;
 
 import com.example.plugin.util.CsvExporter;
-import com.example.plugin.util.CsvPreviewUtil;
 import com.example.plugin.util.ReferenceFinderUtil;
 import com.intellij.openapi.actionSystem.ActionUpdateThread;
 import com.intellij.openapi.actionSystem.AnAction;
 import com.intellij.openapi.actionSystem.AnActionEvent;
 import com.intellij.openapi.actionSystem.CommonDataKeys;
 import com.intellij.openapi.application.ReadAction;
+import com.intellij.openapi.progress.ProgressIndicator;
 import com.intellij.openapi.progress.ProgressManager;
 import com.intellij.openapi.ui.Messages;
-import com.intellij.psi.PsiDirectory;
-import com.intellij.psi.PsiElement;
-import com.intellij.psi.PsiClass;
-import com.intellij.psi.PsiMethod;
-import com.intellij.psi.PsiPackage;
-import com.intellij.psi.JavaDirectoryService;
+import com.intellij.psi.*;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
@@ -24,9 +19,12 @@ import java.util.Arrays;
 import java.util.List;
 
 /**
- * 项目视图右键菜单：查找包内所有类的全部方法被引用的位置，在 Tool Window 表格中预览。
+ * 项目视图右键菜单：查找包内所有类及其方法被引用的位置，导出 CSV。
+ * 同时包含类引用（类名被使用的位置）和方法引用（方法被调用的位置）。
  */
-public class FindPackageMethodReferencesPreviewAction extends AnAction {
+public class FindPackageReferencesAction extends AnAction {
+
+    static final String HEADER = "源目标,目标项目,目标模块,引用位置\n";
 
     @Override
     public @NotNull ActionUpdateThread getActionUpdateThread() {
@@ -48,25 +46,21 @@ public class FindPackageMethodReferencesPreviewAction extends AnAction {
         PsiPackage pkg = ReadAction.compute(() -> getTargetPackage(e));
         if (pkg == null) return;
 
-        List<PsiMethod> methods = ReadAction.compute(() -> {
-            List<PsiMethod> all = new ArrayList<>();
-            for (PsiClass cls : ReferenceFinderUtil.collectPackageClasses(pkg, e.getProject())) {
-                all.addAll(Arrays.asList(cls.getMethods()));
-            }
-            return all;
-        });
+        List<PsiClass> classes = ReadAction.compute(() ->
+                ReferenceFinderUtil.collectPackageClasses(pkg, e.getProject()));
         String pkgName = ReadAction.compute(pkg::getQualifiedName);
 
-        if (methods.isEmpty()) {
-            Messages.showInfoMessage(e.getProject(), "该包下没有方法，无需查找。", "提示");
-            return;
-        }
-
         List<String[]> results = new ArrayList<>();
-        boolean ok = ProgressManager.getInstance().runProcessWithProgressSynchronously(() ->
-                results.addAll(ReferenceFinderUtil.findReferences(
-                        methods, ProgressManager.getInstance().getProgressIndicator())),
-                "查找包内类方法引用：" + pkgName, true, e.getProject());
+        boolean ok = ProgressManager.getInstance().runProcessWithProgressSynchronously(() -> {
+            ProgressIndicator indicator = ProgressManager.getInstance().getProgressIndicator();
+            results.addAll(ReferenceFinderUtil.findClassReferences(classes, indicator));
+            List<PsiMethod> methods = ReadAction.compute(() -> {
+                List<PsiMethod> all = new ArrayList<>();
+                for (PsiClass cls : classes) all.addAll(Arrays.asList(cls.getMethods()));
+                return all;
+            });
+            results.addAll(ReferenceFinderUtil.findReferences(methods, indicator));
+        }, "查找包内引用：" + pkgName, true, e.getProject());
 
         if (!ok) {
             Messages.showInfoMessage(e.getProject(),
@@ -74,12 +68,11 @@ public class FindPackageMethodReferencesPreviewAction extends AnAction {
             if (results.isEmpty()) return;
         }
 
-        String csv = CsvExporter.buildCsvString(results);
-        CsvPreviewUtil.show(e.getProject(), csv, "pkg-method-refs (" + results.size() + " 条)");
+        CsvExporter.export(results, "pkg-refs", HEADER, e.getProject());
     }
 
     @Nullable
-    private PsiPackage getTargetPackage(@NotNull AnActionEvent e) {
+    static PsiPackage getTargetPackage(@NotNull AnActionEvent e) {
         PsiElement element = e.getData(CommonDataKeys.PSI_ELEMENT);
         if (element instanceof PsiPackage) return (PsiPackage) element;
         if (element instanceof PsiDirectory)
