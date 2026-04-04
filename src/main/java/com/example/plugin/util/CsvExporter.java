@@ -18,10 +18,19 @@ public class CsvExporter {
     private static final String HEADER = "源方法,目标项目,目标模块,引用方法\n";
 
     /**
-     * 将引用结果拼装为 CSV 字符串（含表头）。
+     * 将引用结果拼装为 CSV 字符串（使用默认表头）。
      */
     public static String buildCsvString(List<String[]> results) {
-        StringBuilder sb = new StringBuilder(HEADER);
+        return buildCsvString(results, HEADER);
+    }
+
+    /**
+     * 将引用结果拼装为 CSV 字符串（自定义表头）。
+     *
+     * @param header 表头行，末尾需含 '\n'，例如 "源类,目标项目,目标模块,引用位置\n"
+     */
+    public static String buildCsvString(List<String[]> results, String header) {
+        StringBuilder sb = new StringBuilder(header);
         for (String[] row : results) {
             sb.append(escapeCsv(row[0])).append(",")
               .append(escapeCsv(row[1])).append(",")
@@ -29,6 +38,27 @@ public class CsvExporter {
               .append(escapeCsv(row[3])).append("\n");
         }
         return sb.toString();
+    }
+
+    /**
+     * @param results    引用结果列表，每条为 String[4]
+     * @param filePrefix 文件名前缀
+     * @param header     自定义表头行（末尾含 '\n'）
+     * @param project    当前 IntelliJ 项目
+     */
+    public static void export(List<String[]> results, String filePrefix, String header, Project project) {
+        String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
+        String filePath = System.getProperty("user.home") + File.separator
+                + filePrefix + "-" + timestamp + ".csv";
+
+        try (Writer writer = new OutputStreamWriter(new FileOutputStream(filePath), GBK)) {
+            writer.write(buildCsvString(results, header));
+            Messages.showInfoMessage(project,
+                    "共找到 " + results.size() + " 条引用，已导出至：\n" + filePath,
+                    "导出成功");
+        } catch (IOException ex) {
+            Messages.showErrorDialog(project, "CSV 导出失败：" + ex.getMessage(), "错误");
+        }
     }
 
     /**

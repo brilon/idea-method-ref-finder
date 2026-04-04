@@ -12,6 +12,7 @@ import com.intellij.psi.search.searches.ReferencesSearch;
 import com.intellij.psi.util.PsiTreeUtil;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 /**
@@ -130,6 +131,74 @@ public class ReferenceFinderUtil {
 
                             results.add(new String[]{
                                     sourceSignature, projectName, refInfo[0], refInfo[1]});
+                            return true;
+                        });
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * 递归收集 psiPackage 及其所有子包中属于 project 的 Java 类。
+     *
+     * <p>调用方必须持有 ReadAction。
+     */
+    public static List<PsiClass> collectPackageClasses(PsiPackage psiPackage, Project project) {
+        GlobalSearchScope scope = GlobalSearchScope.projectScope(project);
+        List<PsiClass> result = new ArrayList<>(Arrays.asList(psiPackage.getClasses(scope)));
+        for (PsiPackage sub : psiPackage.getSubPackages(scope)) {
+            result.addAll(collectPackageClasses(sub, project));
+        }
+        return result;
+    }
+
+    /**
+     * 在所有已打开项目中查找给定类列表被引用的位置（类级别引用，非方法级别）。
+     *
+     * <p>CSV 列：源类全限定名, 目标项目, 目标模块, 引用位置（调用方方法签名或文件名）
+     */
+    public static List<String[]> findClassReferences(List<PsiClass> classes, ProgressIndicator indicator) {
+        List<String[]> results = new ArrayList<>();
+
+        for (PsiClass sourceClass : classes) {
+            String qualifiedName = ReadAction.compute(() -> sourceClass.getQualifiedName());
+            if (qualifiedName == null) continue;
+
+            if (indicator != null) {
+                indicator.setText("查找类引用: " + qualifiedName);
+                if (indicator.isCanceled()) break;
+            }
+
+            for (Project project : ProjectManager.getInstance().getOpenProjects()) {
+                if (indicator != null && indicator.isCanceled()) break;
+
+                PsiClass targetClass = ReadAction.compute(() ->
+                        JavaPsiFacade.getInstance(project)
+                                .findClass(qualifiedName, GlobalSearchScope.allScope(project)));
+                if (targetClass == null) continue;
+
+                String projectName = project.getName();
+
+                ReferencesSearch.search(targetClass, GlobalSearchScope.projectScope(project))
+                        .forEach(reference -> {
+                            if (indicator != null && indicator.isCanceled()) return false;
+
+                            String[] refInfo = ReadAction.compute(() -> {
+                                PsiElement refElement = reference.getElement();
+                                Module module = ModuleUtilCore.findModuleForPsiElement(refElement);
+                                String moduleName = module != null ? module.getName() : "";
+                                PsiMethod callerMethod = PsiTreeUtil.getParentOfType(
+                                        refElement, PsiMethod.class);
+                                String location = callerMethod != null
+                                        ? getMethodSignature(callerMethod)
+                                        : (refElement.getContainingFile() != null
+                                                ? refElement.getContainingFile().getName()
+                                                : "(unknown)");
+                                return new String[]{moduleName, location};
+                            });
+
+                            results.add(new String[]{qualifiedName, projectName, refInfo[0], refInfo[1]});
                             return true;
                         });
             }
