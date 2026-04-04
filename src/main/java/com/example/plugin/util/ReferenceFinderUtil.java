@@ -145,7 +145,8 @@ public class ReferenceFinderUtil {
      * <p>调用方必须持有 ReadAction。
      */
     public static List<PsiClass> collectPackageClasses(PsiPackage psiPackage, Project project) {
-        GlobalSearchScope scope = GlobalSearchScope.projectScope(project);
+        // allScope：同时覆盖项目源码和外部库（library）中的类
+        GlobalSearchScope scope = GlobalSearchScope.allScope(project);
         List<PsiClass> result = new ArrayList<>(Arrays.asList(psiPackage.getClasses(scope)));
         for (PsiPackage sub : psiPackage.getSubPackages(scope)) {
             result.addAll(collectPackageClasses(sub, project));

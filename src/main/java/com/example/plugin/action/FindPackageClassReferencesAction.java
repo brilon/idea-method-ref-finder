@@ -68,7 +68,9 @@ public class FindPackageClassReferencesAction extends AnAction {
     @Nullable
     private PsiPackage getTargetPackage(@NotNull AnActionEvent e) {
         PsiElement element = e.getData(CommonDataKeys.PSI_ELEMENT);
-        if (!(element instanceof PsiDirectory)) return null;
-        return JavaDirectoryService.getInstance().getPackage((PsiDirectory) element);
+        if (element instanceof PsiPackage) return (PsiPackage) element;
+        if (element instanceof PsiDirectory)
+            return JavaDirectoryService.getInstance().getPackage((PsiDirectory) element);
+        return null;
     }
 }
