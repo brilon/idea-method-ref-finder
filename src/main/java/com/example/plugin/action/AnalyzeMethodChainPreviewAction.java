@@ -26,7 +26,7 @@ import java.util.List;
  */
 public class AnalyzeMethodChainPreviewAction extends AnAction {
 
-    private static final String HEADER = "源方法/类,直接引用数,可删除,引用状态,样本调用者\n";
+    private static final String HEADER = "源方法,引用方,引用方可删除,引用状态\n";
     private static final int CHAIN_DEPTH = 4;
 
     @Override

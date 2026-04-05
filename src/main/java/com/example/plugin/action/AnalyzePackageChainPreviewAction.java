@@ -23,7 +23,7 @@ import java.util.List;
  */
 public class AnalyzePackageChainPreviewAction extends AnAction {
 
-    static final String HEADER = "源方法/类,直接引用数,可删除,引用状态,样本调用者\n";
+    static final String HEADER = "源方法/类,引用方,引用方可删除,引用状态\n";
     private static final int CHAIN_DEPTH = 4;
 
     @Override

@@ -209,25 +209,26 @@ public class ReferenceFinderUtil {
     }
 
     // ──────────────────────────────────────────────────────────────────────────
-    // 引用链分析（死代码检测：判断方法/类是否有活跃引用，可否删除）
+    // 引用链分析（死代码检测：找出引用方，判断引用方是否有活跃入口，可否删除）
     // ──────────────────────────────────────────────────────────────────────────
 
     /**
-     * 分析方法列表的引用情况，判断每个方法是否为死代码。
-     * <b>每个方法输出一行</b>（含零引用的方法），不再按引用条数展开。
+     * 分析方法列表的引用情况。
      *
-     * <p>引用状态说明：
-     * <ul>
-     *   <li>{@code "无引用"} — 项目内无任何引用，可直接删除</li>
-     *   <li>{@code "死代码链"} — 有引用，但往上 chainDepth 层内所有调用者均无进一步调用者，
-     *       说明整条链路没有活跃入口，可删除</li>
-     *   <li>{@code "有活跃引用"} — 在 chainDepth 层内找到有进一步调用者的方法，应保留</li>
-     * </ul>
+     * <p><b>逻辑：</b>
+     * <ol>
+     *   <li>对每个源方法，找出所有直接引用它的调用方（记为 A）。</li>
+     *   <li>对每个 A，向上追溯最多 {@code chainDepth} 层，判断 A 是否有活跃入口：
+     *       <ul>
+     *         <li>A 无调用者 → A 可删除（"无引用"）</li>
+     *         <li>A 的所有调用链均无活跃入口 → A 可删除（"死代码链"）</li>
+     *         <li>A 存在至少一条活跃调用链 → A 不可删除</li>
+     *       </ul>
+     *   </li>
+     *   <li>若源方法本身无任何引用，则输出一行标注源方法可删除。</li>
+     * </ol>
      *
-     * <p><b>注意：</b>{@code "无引用"} 包括 {@code main()}、{@code @Test} 等合法入口方法，
-     * 因为它们在项目代码中确实没有显式调用者，请人工甄别。
-     *
-     * @return 每条记录为 String[5]：{源方法签名, 直接引用数, 可删除("是"/"否"), 引用状态, 样本调用者}
+     * @return 每条记录为 String[4]：{源方法签名, 引用方签名, 引用方可删除("是"/"否"), 引用状态}
      */
     public static List<String[]> analyzeMethodReferences(
             List<PsiMethod> methods, int chainDepth, ProgressIndicator indicator) {
@@ -250,11 +251,10 @@ public class ReferenceFinderUtil {
                 if (indicator.isCanceled()) break;
             }
 
-            // 收集所有直接调用者
-            int[] refCount           = {0};
-            boolean[] hasNonMethod   = {false};   // 非方法体引用（字段/注解等）→ 直接判活
-            List<PsiMethod> callers  = new ArrayList<>();
-            List<String>    samples  = new ArrayList<>();
+            // 收集所有直接引用方 A
+            boolean[] hasAnyRef    = {false};
+            List<PsiMethod> callerMethods   = new ArrayList<>();
+            List<String>    nonMethodRefs   = new ArrayList<>(); // 非方法体内的引用位置
 
             for (Project project : ProjectManager.getInstance().getOpenProjects()) {
                 if (indicator != null && indicator.isCanceled()) break;
@@ -268,55 +268,55 @@ public class ReferenceFinderUtil {
                 ReferencesSearch.search(target, GlobalSearchScope.projectScope(project))
                         .forEach(ref -> {
                             if (indicator != null && indicator.isCanceled()) return false;
-                            refCount[0]++;
+                            hasAnyRef[0] = true;
                             PsiMethod caller = ReadAction.compute(() ->
                                     PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
                             if (caller == null) {
-                                hasNonMethod[0] = true;
+                                // 字段/注解/静态块等非方法体引用
+                                String loc = ReadAction.compute(() -> {
+                                    PsiFile f2 = ref.getElement().getContainingFile();
+                                    return f2 != null ? f2.getName() + ":" + ref.getElement().getTextOffset() : "非方法体";
+                                });
+                                nonMethodRefs.add(loc);
                             } else {
-                                callers.add(caller);
-                                if (samples.size() < 3) {
-                                    samples.add(ReadAction.compute(() -> getMethodSignature(caller)));
-                                }
+                                callerMethods.add(caller);
                             }
                             return true;
                         });
             }
 
-            // 判定引用状态
-            String deletable, status;
-            if (refCount[0] == 0) {
-                deletable = "是"; status = "无引用";
-            } else if (hasNonMethod[0]) {
-                // 字段/注解等非方法体引用视为活跃
-                deletable = "否"; status = "有活跃引用";
-            } else {
-                boolean allDead = callers.stream().allMatch(caller -> {
-                    String key = ReadAction.compute(() -> getMethodSignature(caller))
-                                 + "|" + chainDepth;
-                    return deadCache.computeIfAbsent(key,
-                            k -> isTransitivelyDead(caller, chainDepth, new HashSet<>()));
-                });
-                deletable = allDead ? "是"  : "否";
-                status    = allDead ? "死代码链" : "有活跃引用";
+            if (!hasAnyRef[0]) {
+                // 源方法本身无任何引用，直接可删除
+                results.add(new String[]{methodSig, "(无引用)", "是", "无引用"});
+                continue;
             }
 
-            results.add(new String[]{
-                    methodSig,
-                    String.valueOf(refCount[0]),
-                    deletable,
-                    status,
-                    samples.isEmpty() ? "-" : String.join(" | ", samples)
-            });
+            // 对每个调用方法 A，判断 A 是否可删除
+            for (PsiMethod callerA : callerMethods) {
+                String callerSig = ReadAction.compute(() -> getMethodSignature(callerA));
+                boolean isDead = deadCache.computeIfAbsent(
+                        callerSig + "|" + chainDepth,
+                        k -> isTransitivelyDead(callerA, chainDepth, new HashSet<>()));
+                results.add(new String[]{
+                        methodSig,
+                        callerSig,
+                        isDead ? "是" : "否",
+                        isDead ? "死代码链" : "有活跃引用"
+                });
+            }
+
+            // 非方法体引用（字段/注解等）→ 活跃，不可删除
+            for (String loc : nonMethodRefs) {
+                results.add(new String[]{methodSig, "非方法体引用: " + loc, "否", "有活跃引用"});
+            }
         }
         return results;
     }
 
     /**
-     * 分析类列表的引用情况（类级别引用，不含方法），判断每个类是否为死代码。
-     * <b>每个类输出一行</b>（含零引用的类）。
+     * 分析类列表的引用情况（类级别引用），找出每条引用所在的调用方，并判断调用方是否可删除。
      *
-     * @return 每条记录为 String[5]：{源类全限定名, 直接引用数, 可删除, 引用状态, 样本调用者}
+     * @return 每条记录为 String[4]：{源类全限定名, 引用方签名, 引用方可删除("是"/"否"), 引用状态}
      */
     public static List<String[]> analyzeClassReferences(
             List<PsiClass> classes, int chainDepth, ProgressIndicator indicator) {
@@ -332,10 +332,9 @@ public class ReferenceFinderUtil {
                 if (indicator.isCanceled()) break;
             }
 
-            int[] refCount          = {0};
-            boolean[] hasNonMethod  = {false};
-            List<PsiMethod> callers = new ArrayList<>();
-            List<String>    samples = new ArrayList<>();
+            boolean[] hasAnyRef  = {false};
+            List<PsiMethod> callerMethods  = new ArrayList<>();
+            List<String>    nonMethodRefs  = new ArrayList<>();
 
             for (Project project : ProjectManager.getInstance().getOpenProjects()) {
                 if (indicator != null && indicator.isCanceled()) break;
@@ -347,44 +346,43 @@ public class ReferenceFinderUtil {
                 ReferencesSearch.search(target, GlobalSearchScope.projectScope(project))
                         .forEach(ref -> {
                             if (indicator != null && indicator.isCanceled()) return false;
-                            refCount[0]++;
+                            hasAnyRef[0] = true;
                             PsiMethod caller = ReadAction.compute(() ->
                                     PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
                             if (caller == null) {
-                                hasNonMethod[0] = true;
+                                String loc = ReadAction.compute(() -> {
+                                    PsiFile f = ref.getElement().getContainingFile();
+                                    return f != null ? f.getName() + ":" + ref.getElement().getTextOffset() : "非方法体";
+                                });
+                                nonMethodRefs.add(loc);
                             } else {
-                                callers.add(caller);
-                                if (samples.size() < 3) {
-                                    samples.add(ReadAction.compute(() -> getMethodSignature(caller)));
-                                }
+                                callerMethods.add(caller);
                             }
                             return true;
                         });
             }
 
-            String deletable, status;
-            if (refCount[0] == 0) {
-                deletable = "是"; status = "无引用";
-            } else if (hasNonMethod[0]) {
-                deletable = "否"; status = "有活跃引用";
-            } else {
-                boolean allDead = callers.stream().allMatch(caller -> {
-                    String key = ReadAction.compute(() -> getMethodSignature(caller))
-                                 + "|" + chainDepth;
-                    return deadCache.computeIfAbsent(key,
-                            k -> isTransitivelyDead(caller, chainDepth, new HashSet<>()));
-                });
-                deletable = allDead ? "是"  : "否";
-                status    = allDead ? "死代码链" : "有活跃引用";
+            if (!hasAnyRef[0]) {
+                results.add(new String[]{qualifiedName, "(无引用)", "是", "无引用"});
+                continue;
             }
 
-            results.add(new String[]{
-                    qualifiedName,
-                    String.valueOf(refCount[0]),
-                    deletable,
-                    status,
-                    samples.isEmpty() ? "-" : String.join(" | ", samples)
-            });
+            for (PsiMethod callerA : callerMethods) {
+                String callerSig = ReadAction.compute(() -> getMethodSignature(callerA));
+                boolean isDead = deadCache.computeIfAbsent(
+                        callerSig + "|" + chainDepth,
+                        k -> isTransitivelyDead(callerA, chainDepth, new HashSet<>()));
+                results.add(new String[]{
+                        qualifiedName,
+                        callerSig,
+                        isDead ? "是" : "否",
+                        isDead ? "死代码链" : "有活跃引用"
+                });
+            }
+
+            for (String loc : nonMethodRefs) {
+                results.add(new String[]{qualifiedName, "非方法体引用: " + loc, "否", "有活跃引用"});
+            }
         }
         return results;
     }
