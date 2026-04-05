@@ -506,13 +506,13 @@ public class ReferenceFinderUtil {
     }
 
     /**
-     * 在所有已打开项目中查找方法引用，并对每条结果的引用方法（及其往上 {@code chainDepth} 层
-     * 的调用链）收集 Javadoc 注释，拼接后作为第 5 列输出。
+     * 在所有已打开项目中查找方法引用，对每个引用方 A 收集：
+     * A 自身的注释 + A 的直接调用者注释 + 第 2 层调用者注释 + 第 3 层调用者注释（共 chainDepth 层），
+     * 以 {@code " | "} 拼接后放到 A 旁边的"引用链注释"列。
      *
-     * <p>只搜索项目范围内的调用（{@code projectScope}），不包含外部库。
+     * <p>每个引用方 A 输出一行（而非每个源方法一行），便于逐行查看每条引用的完整调用链注释。
      *
-     * @return 每条记录为 String[5]：{源方法签名, 目标项目, 目标模块, 引用方法, 引用链注释}
-     *         "引用链注释" 为调用链上所有方法/类注释以 {@code " | "} 拼接的字符串
+     * @return 每条记录为 String[3]：{源方法签名, 引用方A签名, 引用链注释}
      */
     public static List<String[]> findReferencesWithComments(
             List<PsiMethod> methods, int chainDepth, ProgressIndicator indicator) {
@@ -549,52 +549,44 @@ public class ReferenceFinderUtil {
                 });
                 if (targetMethod == null) continue;
 
-                String projectName = project.getName();
-
                 ReferencesSearch.search(targetMethod, GlobalSearchScope.projectScope(project))
                         .forEach(reference -> {
                             if (indicator != null && indicator.isCanceled()) return false;
 
-                            String[] refInfo = ReadAction.compute(() -> {
+                            // 取引用方 A 的签名
+                            String callerSig = ReadAction.compute(() -> {
                                 PsiElement refElement = reference.getElement();
-                                Module module = ModuleUtilCore.findModuleForPsiElement(refElement);
-                                String moduleName = module != null ? module.getName() : "";
                                 PsiMethod callerMethod = PsiTreeUtil.getParentOfType(
                                         refElement, PsiMethod.class);
-                                String callerSig;
-                                if (callerMethod != null) {
-                                    callerSig = getMethodSignature(callerMethod);
-                                } else {
-                                    PsiFile file = refElement.getContainingFile();
-                                    callerSig = file != null ? file.getName() : "(unknown)";
-                                }
-                                return new String[]{moduleName, callerSig};
+                                if (callerMethod != null) return getMethodSignature(callerMethod);
+                                PsiFile file = refElement.getContainingFile();
+                                return file != null ? file.getName() : "(unknown)";
                             });
 
                             PsiMethod callerMethod = ReadAction.compute(() ->
                                     PsiTreeUtil.getParentOfType(
                                             reference.getElement(), PsiMethod.class));
 
+                            // 收集 A 的注释 + A 往上各层调用者的注释
                             String chainComments;
                             if (callerMethod == null) {
-                                // 引用在类体/字段中，取所在类的注释
+                                // 非方法体引用（字段/注解等）→ 取所在类注释
                                 chainComments = ReadAction.compute(() -> {
                                     PsiClass cls = PsiTreeUtil.getParentOfType(
                                             reference.getElement(), PsiClass.class);
                                     return cls != null ? getClassComment(cls) : "";
                                 });
                             } else {
-                                String cacheKey = refInfo[1] + "|" + chainDepth;
-                                chainComments = commentsCache.computeIfAbsent(cacheKey, k -> {
-                                    LinkedHashSet<String> commentSet = new LinkedHashSet<>();
-                                    collectChainComments(
-                                            callerMethod, chainDepth, new HashSet<>(), commentSet);
-                                    return String.join(" | ", commentSet);
-                                });
+                                chainComments = commentsCache.computeIfAbsent(
+                                        callerSig + "|" + chainDepth, k -> {
+                                            LinkedHashSet<String> commentSet = new LinkedHashSet<>();
+                                            collectChainComments(
+                                                    callerMethod, chainDepth, new HashSet<>(), commentSet);
+                                            return String.join(" | ", commentSet);
+                                        });
                             }
 
-                            results.add(new String[]{
-                                    sourceSignature, projectName, refInfo[0], refInfo[1], chainComments});
+                            results.add(new String[]{sourceSignature, callerSig, chainComments});
                             return true;
                         });
             }
@@ -603,10 +595,9 @@ public class ReferenceFinderUtil {
     }
 
     /**
-     * 在所有已打开项目中查找类引用，并对每条结果的引用位置往上追溯 {@code chainDepth} 层，
-     * 收集 Javadoc 注释拼接为第 5 列。
+     * 在所有已打开项目中查找类引用，对每个引用方 A 收集调用链注释（同 {@link #findReferencesWithComments}）。
      *
-     * @return 每条记录为 String[5]：{源类全限定名, 目标项目, 目标模块, 引用位置, 引用链注释}
+     * @return 每条记录为 String[3]：{源类全限定名, 引用方签名, 引用链注释}
      */
     public static List<String[]> findClassReferencesWithComments(
             List<PsiClass> classes, int chainDepth, ProgressIndicator indicator) {
@@ -630,24 +621,17 @@ public class ReferenceFinderUtil {
                                 .findClass(qualifiedName, GlobalSearchScope.allScope(project)));
                 if (targetClass == null) continue;
 
-                String projectName = project.getName();
-
                 ReferencesSearch.search(targetClass, GlobalSearchScope.projectScope(project))
                         .forEach(reference -> {
                             if (indicator != null && indicator.isCanceled()) return false;
 
-                            String[] refInfo = ReadAction.compute(() -> {
+                            String callerSig = ReadAction.compute(() -> {
                                 PsiElement refElement = reference.getElement();
-                                Module module = ModuleUtilCore.findModuleForPsiElement(refElement);
-                                String moduleName = module != null ? module.getName() : "";
                                 PsiMethod callerMethod = PsiTreeUtil.getParentOfType(
                                         refElement, PsiMethod.class);
-                                String location = callerMethod != null
-                                        ? getMethodSignature(callerMethod)
-                                        : (refElement.getContainingFile() != null
-                                                ? refElement.getContainingFile().getName()
-                                                : "(unknown)");
-                                return new String[]{moduleName, location};
+                                if (callerMethod != null) return getMethodSignature(callerMethod);
+                                PsiFile file = refElement.getContainingFile();
+                                return file != null ? file.getName() : "(unknown)";
                             });
 
                             PsiMethod callerMethod = ReadAction.compute(() ->
@@ -662,17 +646,16 @@ public class ReferenceFinderUtil {
                                     return cls != null ? getClassComment(cls) : "";
                                 });
                             } else {
-                                String cacheKey = refInfo[1] + "|" + chainDepth;
-                                chainComments = commentsCache.computeIfAbsent(cacheKey, k -> {
-                                    LinkedHashSet<String> commentSet = new LinkedHashSet<>();
-                                    collectChainComments(
-                                            callerMethod, chainDepth, new HashSet<>(), commentSet);
-                                    return String.join(" | ", commentSet);
-                                });
+                                chainComments = commentsCache.computeIfAbsent(
+                                        callerSig + "|" + chainDepth, k -> {
+                                            LinkedHashSet<String> commentSet = new LinkedHashSet<>();
+                                            collectChainComments(
+                                                    callerMethod, chainDepth, new HashSet<>(), commentSet);
+                                            return String.join(" | ", commentSet);
+                                        });
                             }
 
-                            results.add(new String[]{
-                                    qualifiedName, projectName, refInfo[0], refInfo[1], chainComments});
+                            results.add(new String[]{qualifiedName, callerSig, chainComments});
                             return true;
                         });
             }

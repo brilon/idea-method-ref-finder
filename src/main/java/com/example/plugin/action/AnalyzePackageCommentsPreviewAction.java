@@ -24,7 +24,7 @@ import java.util.List;
  */
 public class AnalyzePackageCommentsPreviewAction extends AnAction {
 
-    static final String HEADER = "源目标,目标项目,目标模块,引用位置,引用链注释\n";
+    static final String HEADER = "源方法/类,引用方,引用链注释\n";
     private static final int CHAIN_DEPTH = 4;
 
     @Override
@@ -72,6 +72,6 @@ public class AnalyzePackageCommentsPreviewAction extends AnAction {
         }
 
         String csv = CsvExporter.buildCsvString(results, HEADER);
-        CsvPreviewUtil.show(e.getProject(), csv, "pkg-comments (" + results.size() + " 条)");
+        CsvPreviewUtil.show(e.getProject(), csv, "包引用链注释 (" + results.size() + " 条)");
     }
 }
