@@ -26,7 +26,7 @@ import java.util.List;
  */
 public class AnalyzeMethodChainPreviewAction extends AnAction {
 
-    private static final String HEADER = "源方法,目标项目,目标模块,引用方法,引用链状态\n";
+    private static final String HEADER = "源方法/类,直接引用数,可删除,引用状态,样本调用者\n";
     private static final int CHAIN_DEPTH = 4;
 
     @Override
@@ -49,7 +49,7 @@ public class AnalyzeMethodChainPreviewAction extends AnAction {
         List<String[]> results = new ArrayList<>();
 
         boolean ok = ProgressManager.getInstance().runProcessWithProgressSynchronously(() ->
-                results.addAll(ReferenceFinderUtil.findReferencesWithChainAnalysis(
+                results.addAll(ReferenceFinderUtil.analyzeMethodReferences(
                         Collections.singletonList(method),
                         CHAIN_DEPTH,
                         ProgressManager.getInstance().getProgressIndicator())),
@@ -62,7 +62,7 @@ public class AnalyzeMethodChainPreviewAction extends AnAction {
         }
 
         String csv = CsvExporter.buildCsvString(results, HEADER);
-        CsvPreviewUtil.show(e.getProject(), csv, "method-chain (" + results.size() + " 条)");
+        CsvPreviewUtil.show(e.getProject(), csv, "方法引用分析 (" + results.size() + " 个方法)");
     }
 
     @Nullable

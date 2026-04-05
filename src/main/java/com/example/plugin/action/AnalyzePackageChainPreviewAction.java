@@ -23,7 +23,7 @@ import java.util.List;
  */
 public class AnalyzePackageChainPreviewAction extends AnAction {
 
-    static final String HEADER = "源目标,目标项目,目标模块,引用位置,引用链状态\n";
+    static final String HEADER = "源方法/类,直接引用数,可删除,引用状态,样本调用者\n";
     private static final int CHAIN_DEPTH = 4;
 
     @Override
@@ -53,14 +53,14 @@ public class AnalyzePackageChainPreviewAction extends AnAction {
         List<String[]> results = new ArrayList<>();
         boolean ok = ProgressManager.getInstance().runProcessWithProgressSynchronously(() -> {
             ProgressIndicator indicator = ProgressManager.getInstance().getProgressIndicator();
-            results.addAll(ReferenceFinderUtil.findClassReferencesWithChainAnalysis(
+            results.addAll(ReferenceFinderUtil.analyzeClassReferences(
                     classes, CHAIN_DEPTH, indicator));
             List<PsiMethod> methods = ReadAction.compute(() -> {
                 List<PsiMethod> all = new ArrayList<>();
                 for (PsiClass cls : classes) all.addAll(Arrays.asList(cls.getMethods()));
                 return all;
             });
-            results.addAll(ReferenceFinderUtil.findReferencesWithChainAnalysis(
+            results.addAll(ReferenceFinderUtil.analyzeMethodReferences(
                     methods, CHAIN_DEPTH, indicator));
         }, "分析包内引用链：" + pkgName, true, e.getProject());
 
@@ -71,6 +71,6 @@ public class AnalyzePackageChainPreviewAction extends AnAction {
         }
 
         String csv = CsvExporter.buildCsvString(results, HEADER);
-        CsvPreviewUtil.show(e.getProject(), csv, "pkg-chain (" + results.size() + " 条)");
+        CsvPreviewUtil.show(e.getProject(), csv, "包引用分析 (" + results.size() + " 个条目)");
     }
 }

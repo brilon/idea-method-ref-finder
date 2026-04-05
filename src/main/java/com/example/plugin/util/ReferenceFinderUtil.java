@@ -209,227 +209,239 @@ public class ReferenceFinderUtil {
     }
 
     // ──────────────────────────────────────────────────────────────────────────
-    // 引用链分析（往上追溯 N 层，标记链路是否终止）
+    // 引用链分析（死代码检测：判断方法/类是否有活跃引用，可否删除）
     // ──────────────────────────────────────────────────────────────────────────
 
     /**
-     * 在所有已打开项目中查找方法引用，并对每条结果的引用方法再往上追溯 {@code chainDepth} 层，
-     * 判断该引用方法的调用链是否终止（即在 chainDepth 层内无继续引用）。
+     * 分析方法列表的引用情况，判断每个方法是否为死代码。
+     * <b>每个方法输出一行</b>（含零引用的方法），不再按引用条数展开。
      *
-     * @return 每条记录为 String[5]：{源方法签名, 目标项目, 目标模块, 引用方法, 引用链状态}
-     *         引用链状态：{@code "链路终止"} 表示往上 chainDepth 层内无调用者，
-     *                     {@code "链路继续"} 表示仍有调用者，
-     *                     {@code "非方法体引用"} 表示引用不在方法内（如字段/初始化块）
+     * <p>引用状态说明：
+     * <ul>
+     *   <li>{@code "无引用"} — 项目内无任何引用，可直接删除</li>
+     *   <li>{@code "死代码链"} — 有引用，但往上 chainDepth 层内所有调用者均无进一步调用者，
+     *       说明整条链路没有活跃入口，可删除</li>
+     *   <li>{@code "有活跃引用"} — 在 chainDepth 层内找到有进一步调用者的方法，应保留</li>
+     * </ul>
+     *
+     * <p><b>注意：</b>{@code "无引用"} 包括 {@code main()}、{@code @Test} 等合法入口方法，
+     * 因为它们在项目代码中确实没有显式调用者，请人工甄别。
+     *
+     * @return 每条记录为 String[5]：{源方法签名, 直接引用数, 可删除("是"/"否"), 引用状态, 样本调用者}
      */
-    public static List<String[]> findReferencesWithChainAnalysis(
+    public static List<String[]> analyzeMethodReferences(
             List<PsiMethod> methods, int chainDepth, ProgressIndicator indicator) {
         List<String[]> results = new ArrayList<>();
-        Map<String, Boolean> chainCache = new HashMap<>();
+        Map<String, Boolean> deadCache = new HashMap<>();
 
         for (PsiMethod sourceMethod : methods) {
             String[] sourceInfo = ReadAction.compute(() -> {
                 PsiClass sourceClass = sourceMethod.getContainingClass();
                 if (sourceClass == null) return null;
-                String qualifiedClassName = sourceClass.getQualifiedName();
-                if (qualifiedClassName == null) return null;
-                return new String[]{qualifiedClassName, getMethodSignature(sourceMethod)};
+                String qName = sourceClass.getQualifiedName();
+                if (qName == null) return null;
+                return new String[]{qName, getMethodSignature(sourceMethod)};
             });
             if (sourceInfo == null) continue;
 
-            String qualifiedClassName = sourceInfo[0];
-            String sourceSignature    = sourceInfo[1];
-
+            String methodSig = sourceInfo[1];
             if (indicator != null) {
-                indicator.setText("分析引用链: " + sourceSignature);
+                indicator.setText("分析引用: " + methodSig);
                 if (indicator.isCanceled()) break;
             }
 
+            // 收集所有直接调用者
+            int[] refCount           = {0};
+            boolean[] hasNonMethod   = {false};   // 非方法体引用（字段/注解等）→ 直接判活
+            List<PsiMethod> callers  = new ArrayList<>();
+            List<String>    samples  = new ArrayList<>();
+
             for (Project project : ProjectManager.getInstance().getOpenProjects()) {
                 if (indicator != null && indicator.isCanceled()) break;
-
-                PsiMethod targetMethod = ReadAction.compute(() -> {
-                    JavaPsiFacade facade = JavaPsiFacade.getInstance(project);
-                    PsiClass targetClass = facade.findClass(
-                            qualifiedClassName, GlobalSearchScope.allScope(project));
-                    if (targetClass == null) return null;
-                    return findMatchingMethod(targetClass, sourceMethod);
+                PsiMethod target = ReadAction.compute(() -> {
+                    JavaPsiFacade f = JavaPsiFacade.getInstance(project);
+                    PsiClass cls = f.findClass(sourceInfo[0], GlobalSearchScope.allScope(project));
+                    return cls == null ? null : findMatchingMethod(cls, sourceMethod);
                 });
-                if (targetMethod == null) continue;
+                if (target == null) continue;
 
-                String projectName = project.getName();
-
-                ReferencesSearch.search(targetMethod, GlobalSearchScope.projectScope(project))
-                        .forEach(reference -> {
+                ReferencesSearch.search(target, GlobalSearchScope.projectScope(project))
+                        .forEach(ref -> {
                             if (indicator != null && indicator.isCanceled()) return false;
-
-                            String[] refInfo = ReadAction.compute(() -> {
-                                PsiElement refElement = reference.getElement();
-                                Module module = ModuleUtilCore.findModuleForPsiElement(refElement);
-                                String moduleName = module != null ? module.getName() : "";
-                                PsiMethod callerMethod = PsiTreeUtil.getParentOfType(
-                                        refElement, PsiMethod.class);
-                                String callerSignature;
-                                if (callerMethod != null) {
-                                    callerSignature = getMethodSignature(callerMethod);
-                                } else {
-                                    PsiFile file = refElement.getContainingFile();
-                                    callerSignature = file != null ? file.getName() : "(unknown)";
-                                }
-                                return new String[]{moduleName, callerSignature};
-                            });
-
-                            PsiMethod callerMethod = ReadAction.compute(() ->
-                                    PsiTreeUtil.getParentOfType(
-                                            reference.getElement(), PsiMethod.class));
-
-                            String chainStatus;
-                            if (callerMethod == null) {
-                                chainStatus = "非方法体引用";
+                            refCount[0]++;
+                            PsiMethod caller = ReadAction.compute(() ->
+                                    PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
+                            if (caller == null) {
+                                hasNonMethod[0] = true;
                             } else {
-                                String cacheKey = refInfo[1] + "|" + chainDepth;
-                                boolean terminated = chainCache.computeIfAbsent(cacheKey,
-                                        k -> isCallerChainTerminated(
-                                                callerMethod, chainDepth, new HashSet<>()));
-                                chainStatus = terminated ? "链路终止" : "链路继续";
+                                callers.add(caller);
+                                if (samples.size() < 3) {
+                                    samples.add(ReadAction.compute(() -> getMethodSignature(caller)));
+                                }
                             }
-
-                            results.add(new String[]{
-                                    sourceSignature, projectName, refInfo[0], refInfo[1], chainStatus});
                             return true;
                         });
             }
+
+            // 判定引用状态
+            String deletable, status;
+            if (refCount[0] == 0) {
+                deletable = "是"; status = "无引用";
+            } else if (hasNonMethod[0]) {
+                // 字段/注解等非方法体引用视为活跃
+                deletable = "否"; status = "有活跃引用";
+            } else {
+                boolean allDead = callers.stream().allMatch(caller -> {
+                    String key = ReadAction.compute(() -> getMethodSignature(caller))
+                                 + "|" + chainDepth;
+                    return deadCache.computeIfAbsent(key,
+                            k -> isTransitivelyDead(caller, chainDepth, new HashSet<>()));
+                });
+                deletable = allDead ? "是"  : "否";
+                status    = allDead ? "死代码链" : "有活跃引用";
+            }
+
+            results.add(new String[]{
+                    methodSig,
+                    String.valueOf(refCount[0]),
+                    deletable,
+                    status,
+                    samples.isEmpty() ? "-" : String.join(" | ", samples)
+            });
         }
         return results;
     }
 
     /**
-     * 在所有已打开项目中查找类引用，并对每条结果的引用位置往上追溯 {@code chainDepth} 层，
-     * 判断该引用方法的调用链是否终止。
+     * 分析类列表的引用情况（类级别引用，不含方法），判断每个类是否为死代码。
+     * <b>每个类输出一行</b>（含零引用的类）。
      *
-     * @return 每条记录为 String[5]：{源类全限定名, 目标项目, 目标模块, 引用位置, 引用链状态}
+     * @return 每条记录为 String[5]：{源类全限定名, 直接引用数, 可删除, 引用状态, 样本调用者}
      */
-    public static List<String[]> findClassReferencesWithChainAnalysis(
+    public static List<String[]> analyzeClassReferences(
             List<PsiClass> classes, int chainDepth, ProgressIndicator indicator) {
         List<String[]> results = new ArrayList<>();
-        Map<String, Boolean> chainCache = new HashMap<>();
+        Map<String, Boolean> deadCache = new HashMap<>();
 
         for (PsiClass sourceClass : classes) {
             String qualifiedName = ReadAction.compute(() -> sourceClass.getQualifiedName());
             if (qualifiedName == null) continue;
 
             if (indicator != null) {
-                indicator.setText("分析类引用链: " + qualifiedName);
+                indicator.setText("分析类引用: " + qualifiedName);
                 if (indicator.isCanceled()) break;
             }
 
+            int[] refCount          = {0};
+            boolean[] hasNonMethod  = {false};
+            List<PsiMethod> callers = new ArrayList<>();
+            List<String>    samples = new ArrayList<>();
+
             for (Project project : ProjectManager.getInstance().getOpenProjects()) {
                 if (indicator != null && indicator.isCanceled()) break;
-
-                PsiClass targetClass = ReadAction.compute(() ->
+                PsiClass target = ReadAction.compute(() ->
                         JavaPsiFacade.getInstance(project)
                                 .findClass(qualifiedName, GlobalSearchScope.allScope(project)));
-                if (targetClass == null) continue;
+                if (target == null) continue;
 
-                String projectName = project.getName();
-
-                ReferencesSearch.search(targetClass, GlobalSearchScope.projectScope(project))
-                        .forEach(reference -> {
+                ReferencesSearch.search(target, GlobalSearchScope.projectScope(project))
+                        .forEach(ref -> {
                             if (indicator != null && indicator.isCanceled()) return false;
-
-                            String[] refInfo = ReadAction.compute(() -> {
-                                PsiElement refElement = reference.getElement();
-                                Module module = ModuleUtilCore.findModuleForPsiElement(refElement);
-                                String moduleName = module != null ? module.getName() : "";
-                                PsiMethod callerMethod = PsiTreeUtil.getParentOfType(
-                                        refElement, PsiMethod.class);
-                                String location = callerMethod != null
-                                        ? getMethodSignature(callerMethod)
-                                        : (refElement.getContainingFile() != null
-                                                ? refElement.getContainingFile().getName()
-                                                : "(unknown)");
-                                return new String[]{moduleName, location};
-                            });
-
-                            PsiMethod callerMethod = ReadAction.compute(() ->
-                                    PsiTreeUtil.getParentOfType(
-                                            reference.getElement(), PsiMethod.class));
-
-                            String chainStatus;
-                            if (callerMethod == null) {
-                                chainStatus = "非方法体引用";
+                            refCount[0]++;
+                            PsiMethod caller = ReadAction.compute(() ->
+                                    PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
+                            if (caller == null) {
+                                hasNonMethod[0] = true;
                             } else {
-                                String cacheKey = refInfo[1] + "|" + chainDepth;
-                                boolean terminated = chainCache.computeIfAbsent(cacheKey,
-                                        k -> isCallerChainTerminated(
-                                                callerMethod, chainDepth, new HashSet<>()));
-                                chainStatus = terminated ? "链路终止" : "链路继续";
+                                callers.add(caller);
+                                if (samples.size() < 3) {
+                                    samples.add(ReadAction.compute(() -> getMethodSignature(caller)));
+                                }
                             }
-
-                            results.add(new String[]{
-                                    qualifiedName, projectName, refInfo[0], refInfo[1], chainStatus});
                             return true;
                         });
             }
+
+            String deletable, status;
+            if (refCount[0] == 0) {
+                deletable = "是"; status = "无引用";
+            } else if (hasNonMethod[0]) {
+                deletable = "否"; status = "有活跃引用";
+            } else {
+                boolean allDead = callers.stream().allMatch(caller -> {
+                    String key = ReadAction.compute(() -> getMethodSignature(caller))
+                                 + "|" + chainDepth;
+                    return deadCache.computeIfAbsent(key,
+                            k -> isTransitivelyDead(caller, chainDepth, new HashSet<>()));
+                });
+                deletable = allDead ? "是"  : "否";
+                status    = allDead ? "死代码链" : "有活跃引用";
+            }
+
+            results.add(new String[]{
+                    qualifiedName,
+                    String.valueOf(refCount[0]),
+                    deletable,
+                    status,
+                    samples.isEmpty() ? "-" : String.join(" | ", samples)
+            });
         }
         return results;
     }
 
     /**
-     * 递归检查方法的调用链是否在指定深度内终止。
+     * 判断方法是否为"传递性死代码"（向上最多追溯 depth 层，所有调用路径均无活跃入口）。
      *
      * <ul>
-     *   <li>若该方法在所有项目中均无调用者 → 返回 {@code true}（链路终止）</li>
-     *   <li>若 depth=0 且仍有调用者 → 返回 {@code false}（链路继续，超出检查范围）</li>
-     *   <li>若所有调用者的链路在 depth-1 层内也终止 → 返回 {@code true}</li>
-     *   <li>若任意调用者的链路未终止 → 返回 {@code false}</li>
-     *   <li>循环引用（已在 visited 中）→ 返回 {@code false}（保守处理，视为链路继续）</li>
+     *   <li>无调用者 → {@code true}（死端：无引用的代码，或 main/test 等入口）</li>
+     *   <li>depth=0 且仍有方法调用者 → {@code false}（到达深度上限，保守视为活跃）</li>
+     *   <li>非方法体引用（字段/注解等）→ {@code false}（活跃引用）</li>
+     *   <li>所有调用者均为传递性死代码 → {@code true}</li>
+     *   <li>任意调用者存活 → {@code false}</li>
+     *   <li>循环引用 → {@code false}（保守视为活跃）</li>
      * </ul>
      */
-    private static boolean isCallerChainTerminated(
-            PsiMethod method, int depth, Set<String> visited) {
-        String methodSig = ReadAction.compute(() -> getMethodSignature(method));
-        if (visited.contains(methodSig)) return false; // 循环引用，保守处理
-        visited.add(methodSig);
+    private static boolean isTransitivelyDead(PsiMethod method, int depth, Set<String> visited) {
+        String sig = ReadAction.compute(() -> getMethodSignature(method));
+        if (visited.contains(sig)) return false; // 循环引用，保守视为活跃
+        visited.add(sig);
 
+        AtomicBoolean hasCallers      = new AtomicBoolean(false);
         AtomicBoolean foundLiveCaller = new AtomicBoolean(false);
 
         for (Project project : ProjectManager.getInstance().getOpenProjects()) {
             if (foundLiveCaller.get()) break;
 
-            PsiMethod targetMethod = ReadAction.compute(() -> {
+            PsiMethod target = ReadAction.compute(() -> {
                 PsiClass cls = method.getContainingClass();
                 if (cls == null) return null;
-                String qualifiedName = cls.getQualifiedName();
-                if (qualifiedName == null) return null;
-                JavaPsiFacade facade = JavaPsiFacade.getInstance(project);
-                PsiClass targetClass = facade.findClass(
-                        qualifiedName, GlobalSearchScope.allScope(project));
-                if (targetClass == null) return null;
-                return findMatchingMethod(targetClass, method);
+                String qName = cls.getQualifiedName();
+                if (qName == null) return null;
+                JavaPsiFacade f = JavaPsiFacade.getInstance(project);
+                PsiClass targetClass = f.findClass(qName, GlobalSearchScope.allScope(project));
+                return targetClass == null ? null : findMatchingMethod(targetClass, method);
             });
-            if (targetMethod == null) continue;
+            if (target == null) continue;
 
-            ReferencesSearch.search(targetMethod, GlobalSearchScope.projectScope(project))
+            ReferencesSearch.search(target, GlobalSearchScope.projectScope(project))
                     .forEach(ref -> {
                         if (foundLiveCaller.get()) return false;
+                        hasCallers.set(true);
 
-                        PsiMethod callerMethod = ReadAction.compute(() ->
+                        PsiMethod caller = ReadAction.compute(() ->
                                 PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
 
-                        if (callerMethod == null) {
-                            // 字段/初始化块等非方法体引用，视为活跃入口
+                        if (caller == null) {
+                            // 字段/注解等非方法体引用 → 活跃
                             foundLiveCaller.set(true);
                             return false;
                         }
-
                         if (depth <= 0) {
-                            // 已到达检查深度上限且仍有调用者 → 链路继续
+                            // 到达深度上限且仍有方法调用者 → 保守视为活跃
                             foundLiveCaller.set(true);
                             return false;
                         }
-
-                        // 递归检查上层调用者是否终止
-                        if (!isCallerChainTerminated(callerMethod, depth - 1, new HashSet<>(visited))) {
+                        if (!isTransitivelyDead(caller, depth - 1, new HashSet<>(visited))) {
                             foundLiveCaller.set(true);
                             return false;
                         }
@@ -437,6 +449,7 @@ public class ReferenceFinderUtil {
                     });
         }
 
+        // 无调用者（死端） 或 所有调用者均死亡 → 传递性死代码
         return !foundLiveCaller.get();
     }
 
