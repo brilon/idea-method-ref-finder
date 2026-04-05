@@ -32,10 +32,11 @@ public class CsvExporter {
     public static String buildCsvString(List<String[]> results, String header) {
         StringBuilder sb = new StringBuilder(header);
         for (String[] row : results) {
-            sb.append(escapeCsv(row[0])).append(",")
-              .append(escapeCsv(row[1])).append(",")
-              .append(escapeCsv(row[2])).append(",")
-              .append(escapeCsv(row[3])).append("\n");
+            for (int i = 0; i < row.length; i++) {
+                if (i > 0) sb.append(",");
+                sb.append(escapeCsv(row[i]));
+            }
+            sb.append("\n");
         }
         return sb.toString();
     }

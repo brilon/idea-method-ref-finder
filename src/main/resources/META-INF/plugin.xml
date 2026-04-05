@@ -58,5 +58,47 @@
                 description="查找包（含子包）内所有类及其方法在所有已打开项目中被引用的位置，结果在 Tool Window 表格中预览">
             <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
         </action>
+
+        <action id="com.example.plugin.AnalyzeMethodChainPreview"
+                class="com.example.plugin.action.AnalyzeMethodChainPreviewAction"
+                text="分析方法引用链 (预览CSV)"
+                description="查找该方法的跨项目引用，并对每条引用方法再往上追溯 4 层，标注引用链是否终止，结果在 Tool Window 中预览">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+        </action>
+
+        <action id="com.example.plugin.AnalyzeClassChainPreview"
+                class="com.example.plugin.action.AnalyzeClassChainPreviewAction"
+                text="分析类方法引用链 (预览CSV)"
+                description="查找该类全部方法的跨项目引用，并对每条引用方法再往上追溯 4 层，标注引用链是否终止，结果在 Tool Window 中预览">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+        </action>
+
+        <action id="com.example.plugin.AnalyzePackageChainPreview"
+                class="com.example.plugin.action.AnalyzePackageChainPreviewAction"
+                text="分析包内引用链 (预览CSV)"
+                description="查找包（含子包）内所有类及其方法的跨项目引用，并对每条引用方法再往上追溯 4 层，标注引用链是否终止，结果在 Tool Window 中预览">
+            <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
+        </action>
+
+        <action id="com.example.plugin.AnalyzeMethodCommentsPreview"
+                class="com.example.plugin.action.AnalyzeMethodCommentsPreviewAction"
+                text="查看方法引用链注释 (预览CSV)"
+                description="查找该方法的跨项目引用，收集每条引用方法及其向上 4 层调用链的 Javadoc 注释（无注释时回退到接口/父类），拼接后在 Tool Window 中预览">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+        </action>
+
+        <action id="com.example.plugin.AnalyzeClassCommentsPreview"
+                class="com.example.plugin.action.AnalyzeClassCommentsPreviewAction"
+                text="查看类方法引用链注释 (预览CSV)"
+                description="查找该类全部方法的跨项目引用，收集每条引用方法及其向上 4 层调用链的 Javadoc 注释（无注释时回退到接口/父类），拼接后在 Tool Window 中预览">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+        </action>
+
+        <action id="com.example.plugin.AnalyzePackageCommentsPreview"
+                class="com.example.plugin.action.AnalyzePackageCommentsPreviewAction"
+                text="查看包内引用链注释 (预览CSV)"
+                description="查找包（含子包）内所有类及其方法的跨项目引用，收集每条引用方法及其向上 4 层调用链的 Javadoc 注释（无注释时回退到接口/父类），拼接后在 Tool Window 中预览">
+            <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
+        </action>
     </actions>
 </idea-plugin>
