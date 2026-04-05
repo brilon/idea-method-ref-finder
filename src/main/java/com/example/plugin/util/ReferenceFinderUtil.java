@@ -209,6 +209,144 @@ public class ReferenceFinderUtil {
     }
 
     // ──────────────────────────────────────────────────────────────────────────
+    // 包引用 + Cache 方法检查
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /**
+     * 查找包内所有类及其方法的引用，并对每条引用的调用方检查是否调用了含 "cache" 关键词的方法。
+     *
+     * <p>输出 6 列：
+     * <ol>
+     *   <li>源类（全限定名或方法签名）</li>
+     *   <li>目标项目</li>
+     *   <li>目标模块</li>
+     *   <li>引用位置（调用方方法签名或文件名）</li>
+     *   <li>含Cache方法：{@code "是"} / {@code "否"} / {@code "-"}（非方法体引用时）</li>
+     *   <li>Cache方法列表：含 cache 的被调用方法签名，以 {@code " | "} 分隔；无则 {@code "-"}</li>
+     * </ol>
+     */
+    public static List<String[]> findPackageReferencesWithCacheCheck(
+            List<PsiClass> classes, ProgressIndicator indicator) {
+        List<String[]> results = new ArrayList<>();
+
+        for (PsiClass sourceClass : classes) {
+            String qualifiedName = ReadAction.compute(() -> sourceClass.getQualifiedName());
+            if (qualifiedName == null) continue;
+
+            // ── 类级别引用 ──
+            if (indicator != null) {
+                indicator.setText("查找类引用: " + qualifiedName);
+                if (indicator.isCanceled()) break;
+            }
+            for (Project project : ProjectManager.getInstance().getOpenProjects()) {
+                if (indicator != null && indicator.isCanceled()) break;
+                PsiClass targetClass = ReadAction.compute(() ->
+                        JavaPsiFacade.getInstance(project)
+                                .findClass(qualifiedName, GlobalSearchScope.allScope(project)));
+                if (targetClass == null) continue;
+                String projectName = project.getName();
+
+                ReferencesSearch.search(targetClass, GlobalSearchScope.projectScope(project))
+                        .forEach(ref -> {
+                            if (indicator != null && indicator.isCanceled()) return false;
+                            results.add(buildCacheRow(qualifiedName, projectName, ref));
+                            return true;
+                        });
+            }
+
+            // ── 方法级别引用 ──
+            List<PsiMethod> methods = ReadAction.compute(() ->
+                    Arrays.asList(sourceClass.getMethods()));
+
+            for (PsiMethod sourceMethod : methods) {
+                String[] sourceInfo = ReadAction.compute(() -> {
+                    String qName = sourceClass.getQualifiedName();
+                    if (qName == null) return null;
+                    return new String[]{qName, getMethodSignature(sourceMethod)};
+                });
+                if (sourceInfo == null) continue;
+                String methodSig = sourceInfo[1];
+
+                if (indicator != null) {
+                    indicator.setText("查找方法引用: " + methodSig);
+                    if (indicator.isCanceled()) break;
+                }
+
+                for (Project project : ProjectManager.getInstance().getOpenProjects()) {
+                    if (indicator != null && indicator.isCanceled()) break;
+                    PsiMethod targetMethod = ReadAction.compute(() -> {
+                        JavaPsiFacade f = JavaPsiFacade.getInstance(project);
+                        PsiClass cls = f.findClass(sourceInfo[0], GlobalSearchScope.allScope(project));
+                        return cls == null ? null : findMatchingMethod(cls, sourceMethod);
+                    });
+                    if (targetMethod == null) continue;
+                    String projectName = project.getName();
+
+                    ReferencesSearch.search(targetMethod, GlobalSearchScope.projectScope(project))
+                            .forEach(ref -> {
+                                if (indicator != null && indicator.isCanceled()) return false;
+                                results.add(buildCacheRow(methodSig, projectName, ref));
+                                return true;
+                            });
+                }
+            }
+        }
+        return results;
+    }
+
+    /** 构造一行 cache 检查结果：{源目标, 项目, 模块, 引用位置, 含Cache方法, Cache方法列表}。 */
+    private static String[] buildCacheRow(String sourceLabel, String projectName, PsiReference ref) {
+        String[] meta = ReadAction.compute(() -> {
+            PsiElement refElement = ref.getElement();
+            Module module = ModuleUtilCore.findModuleForPsiElement(refElement);
+            String moduleName = module != null ? module.getName() : "";
+            PsiMethod callerMethod = PsiTreeUtil.getParentOfType(refElement, PsiMethod.class);
+            String location = callerMethod != null
+                    ? getMethodSignature(callerMethod)
+                    : (refElement.getContainingFile() != null
+                            ? refElement.getContainingFile().getName()
+                            : "(unknown)");
+            return new String[]{moduleName, location};
+        });
+
+        PsiMethod callerMethod = ReadAction.compute(() ->
+                PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
+
+        String hasCacheFlag, cacheList;
+        if (callerMethod == null) {
+            hasCacheFlag = "-";
+            cacheList    = "-";
+        } else {
+            List<String> cacheCalls = ReadAction.compute(() ->
+                    findCacheCallsInMethod(callerMethod));
+            hasCacheFlag = cacheCalls.isEmpty() ? "否" : "是";
+            cacheList    = cacheCalls.isEmpty() ? "-" : String.join(" | ", cacheCalls);
+        }
+
+        return new String[]{sourceLabel, projectName, meta[0], meta[1], hasCacheFlag, cacheList};
+    }
+
+    /**
+     * 在方法体内查找所有方法名含 "cache"（不区分大小写）的调用，返回它们的签名列表。
+     *
+     * <p>调用方必须持有 ReadAction。
+     */
+    private static List<String> findCacheCallsInMethod(PsiMethod method) {
+        List<String> result = new ArrayList<>();
+        java.util.Collection<PsiMethodCallExpression> calls =
+                PsiTreeUtil.findChildrenOfType(method, PsiMethodCallExpression.class);
+        java.util.LinkedHashSet<String> seen = new java.util.LinkedHashSet<>();
+        for (PsiMethodCallExpression call : calls) {
+            String refName = call.getMethodExpression().getReferenceName();
+            if (refName == null || !refName.toLowerCase().contains("cache")) continue;
+            PsiMethod resolved = call.resolveMethod();
+            String sig = resolved != null ? getMethodSignature(resolved) : refName + "()";
+            if (seen.add(sig)) result.add(sig);
+        }
+        return result;
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
     // 引用链分析（死代码检测：找出引用方，判断引用方是否有活跃入口，可否删除）
     // ──────────────────────────────────────────────────────────────────────────
 
