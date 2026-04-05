@@ -347,6 +347,261 @@ public class ReferenceFinderUtil {
     }
 
     // ──────────────────────────────────────────────────────────────────────────
+    // 包引用 + RestController 接口检查
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /** Mapping 注解简单名集合（不依赖 Spring JAR，用短名匹配）。 */
+    private static final Set<String> MAPPING_ANNOTATIONS = new HashSet<>(Arrays.asList(
+            "GetMapping", "PostMapping", "PutMapping",
+            "DeleteMapping", "PatchMapping", "RequestMapping"
+    ));
+
+    /**
+     * 查找包内所有类及其方法的引用，并对每条引用的调用方检查：
+     * 该调用方法是否为 {@code @RestController} / {@code @Controller} 的接口方法；
+     * 若是，则输出完整 HTTP 接口路径（类路径 + 方法路径）。
+     *
+     * <p>输出 6 列：
+     * <ol>
+     *   <li>源类（全限定名或方法签名）</li>
+     *   <li>目标项目</li>
+     *   <li>目标模块</li>
+     *   <li>引用位置（调用方方法签名或文件名）</li>
+     *   <li>是否Controller接口：{@code "是"} / {@code "否"} / {@code "-"}（非方法体引用时）</li>
+     *   <li>完整接口路径：例如 {@code "GET /api/v1/users/{id}"}；非接口时为 {@code "-"}</li>
+     * </ol>
+     */
+    public static List<String[]> findPackageReferencesWithControllerCheck(
+            List<PsiClass> classes, ProgressIndicator indicator) {
+        List<String[]> results = new ArrayList<>();
+
+        for (PsiClass sourceClass : classes) {
+            String qualifiedName = ReadAction.compute(() -> sourceClass.getQualifiedName());
+            if (qualifiedName == null) continue;
+
+            // ── 类级别引用 ──
+            if (indicator != null) {
+                indicator.setText("查找类引用(Controller检查): " + qualifiedName);
+                if (indicator.isCanceled()) break;
+            }
+            for (Project project : ProjectManager.getInstance().getOpenProjects()) {
+                if (indicator != null && indicator.isCanceled()) break;
+                PsiClass targetClass = ReadAction.compute(() ->
+                        JavaPsiFacade.getInstance(project)
+                                .findClass(qualifiedName, GlobalSearchScope.allScope(project)));
+                if (targetClass == null) continue;
+                String projectName = project.getName();
+
+                ReferencesSearch.search(targetClass, GlobalSearchScope.projectScope(project))
+                        .forEach(ref -> {
+                            if (indicator != null && indicator.isCanceled()) return false;
+                            results.add(buildControllerRow(qualifiedName, projectName, ref));
+                            return true;
+                        });
+            }
+
+            // ── 方法级别引用 ──
+            List<PsiMethod> methods = ReadAction.compute(() ->
+                    Arrays.asList(sourceClass.getMethods()));
+
+            for (PsiMethod sourceMethod : methods) {
+                String[] sourceInfo = ReadAction.compute(() -> {
+                    String qn = sourceClass.getQualifiedName();
+                    if (qn == null) return null;
+                    return new String[]{qn, getMethodSignature(sourceMethod)};
+                });
+                if (sourceInfo == null) continue;
+                String methodSig = sourceInfo[1];
+
+                if (indicator != null) {
+                    indicator.setText("查找方法引用(Controller检查): " + methodSig);
+                    if (indicator.isCanceled()) break;
+                }
+
+                for (Project project : ProjectManager.getInstance().getOpenProjects()) {
+                    if (indicator != null && indicator.isCanceled()) break;
+                    PsiMethod targetMethod = ReadAction.compute(() -> {
+                        JavaPsiFacade f = JavaPsiFacade.getInstance(project);
+                        PsiClass cls = f.findClass(sourceInfo[0], GlobalSearchScope.allScope(project));
+                        return cls == null ? null : findMatchingMethod(cls, sourceMethod);
+                    });
+                    if (targetMethod == null) continue;
+                    String projectName = project.getName();
+
+                    ReferencesSearch.search(targetMethod, GlobalSearchScope.projectScope(project))
+                            .forEach(ref -> {
+                                if (indicator != null && indicator.isCanceled()) return false;
+                                results.add(buildControllerRow(methodSig, projectName, ref));
+                                return true;
+                            });
+                }
+            }
+        }
+        return results;
+    }
+
+    /** 构造一行 Controller 检查结果：{源目标, 项目, 模块, 引用位置, 是否Controller接口, 完整接口路径}。 */
+    private static String[] buildControllerRow(String sourceLabel, String projectName,
+                                               PsiReference ref) {
+        String[] meta = ReadAction.compute(() -> {
+            PsiElement refElement = ref.getElement();
+            Module module = ModuleUtilCore.findModuleForPsiElement(refElement);
+            String moduleName = module != null ? module.getName() : "";
+            PsiMethod callerMethod = PsiTreeUtil.getParentOfType(refElement, PsiMethod.class);
+            String location = callerMethod != null
+                    ? getMethodSignature(callerMethod)
+                    : (refElement.getContainingFile() != null
+                            ? refElement.getContainingFile().getName()
+                            : "(unknown)");
+            return new String[]{moduleName, location};
+        });
+
+        PsiMethod callerMethod = ReadAction.compute(() ->
+                PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
+
+        String[] endpointInfo = callerMethod == null
+                ? new String[]{"-", "-"}
+                : ReadAction.compute(() -> getEndpointInfo(callerMethod));
+
+        return new String[]{sourceLabel, projectName, meta[0], meta[1],
+                endpointInfo[0], endpointInfo[1]};
+    }
+
+    /**
+     * 判断 callerMethod 是否为 RestController/Controller 的接口方法，并返回完整接口路径。
+     *
+     * @return String[2]：{是否Controller接口("是"/"否"), 完整接口路径("GET /api/v1/users/{id}" 或 "-")}
+     *         调用方必须持有 ReadAction。
+     */
+    private static String[] getEndpointInfo(PsiMethod callerMethod) {
+        PsiClass containingClass = callerMethod.getContainingClass();
+        if (containingClass == null) return new String[]{"否", "-"};
+
+        // 检查类是否有 @RestController 或 @Controller
+        boolean isController = false;
+        for (PsiAnnotation ann : containingClass.getAnnotations()) {
+            String name = shortName(ann);
+            if ("RestController".equals(name) || "Controller".equals(name)) {
+                isController = true;
+                break;
+            }
+        }
+        if (!isController) return new String[]{"否", "-"};
+
+        // 检查方法是否有 Mapping 注解
+        PsiAnnotation mappingAnnotation = null;
+        for (PsiAnnotation ann : callerMethod.getAnnotations()) {
+            if (MAPPING_ANNOTATIONS.contains(shortName(ann))) {
+                mappingAnnotation = ann;
+                break;
+            }
+        }
+        if (mappingAnnotation == null) return new String[]{"否", "-"};
+
+        // 推断 HTTP 方法
+        String httpMethod = resolveHttpMethod(mappingAnnotation);
+
+        // 读取类级别 @RequestMapping 路径
+        String classPath = "";
+        PsiAnnotation classMapping = containingClass.getAnnotation(
+                "org.springframework.web.bind.annotation.RequestMapping");
+        if (classMapping == null) {
+            // 用短名兜底（适配未完整索引的项目）
+            for (PsiAnnotation ann : containingClass.getAnnotations()) {
+                if ("RequestMapping".equals(shortName(ann))) {
+                    classMapping = ann;
+                    break;
+                }
+            }
+        }
+        if (classMapping != null) {
+            classPath = extractAnnotationPath(classMapping);
+        }
+
+        // 读取方法级别 Mapping 路径
+        String methodPath = extractAnnotationPath(mappingAnnotation);
+
+        // 拼接完整路径
+        String fullPath = normalizePath(classPath) + normalizePath(methodPath);
+        if (fullPath.isEmpty()) fullPath = "/";
+
+        return new String[]{"是", httpMethod + " " + fullPath};
+    }
+
+    /** 根据注解名推断 HTTP 方法；{@code @RequestMapping} 则读 {@code method} 属性，默认 GET。 */
+    private static String resolveHttpMethod(PsiAnnotation annotation) {
+        String sn = shortName(annotation);
+        switch (sn) {
+            case "GetMapping":    return "GET";
+            case "PostMapping":   return "POST";
+            case "PutMapping":    return "PUT";
+            case "DeleteMapping": return "DELETE";
+            case "PatchMapping":  return "PATCH";
+            default: // RequestMapping — 读 method 属性
+                PsiAnnotationMemberValue methodAttr =
+                        annotation.findAttributeValue("method");
+                if (methodAttr != null) {
+                    String text = methodAttr.getText();
+                    // e.g. "RequestMethod.POST" or "{RequestMethod.GET, RequestMethod.POST}"
+                    for (String m : new String[]{"POST","PUT","DELETE","PATCH","GET"}) {
+                        if (text.contains(m)) return m;
+                    }
+                }
+                return "GET";
+        }
+    }
+
+    /**
+     * 从 Mapping 注解中提取路径字符串（优先 {@code value}，其次 {@code path}）。
+     * 支持数组形式（取第一个元素）。
+     * 调用方必须持有 ReadAction。
+     */
+    private static String extractAnnotationPath(PsiAnnotation annotation) {
+        for (String attr : new String[]{"value", "path"}) {
+            PsiAnnotationMemberValue val = annotation.findAttributeValue(attr);
+            if (val == null) continue;
+            // 数组形式 e.g. {"/users", "/user"}
+            if (val instanceof PsiArrayInitializerMemberValue) {
+                PsiAnnotationMemberValue[] initializers =
+                        ((PsiArrayInitializerMemberValue) val).getInitializers();
+                if (initializers.length > 0) {
+                    return stripQuotes(initializers[0].getText());
+                }
+            } else {
+                String text = stripQuotes(val.getText());
+                if (!text.isEmpty()) return text;
+            }
+        }
+        return "";
+    }
+
+    /** 从 PsiAnnotation 的全限定名中提取短名（最后一个 . 之后的部分）。 */
+    private static String shortName(PsiAnnotation annotation) {
+        String qn = annotation.getQualifiedName();
+        if (qn == null) return "";
+        int dot = qn.lastIndexOf('.');
+        return dot >= 0 ? qn.substring(dot + 1) : qn;
+    }
+
+    /** 去掉字符串字面量两侧的引号。 */
+    private static String stripQuotes(String s) {
+        if (s == null) return "";
+        s = s.trim();
+        if (s.startsWith("\"") && s.endsWith("\"") && s.length() >= 2) {
+            s = s.substring(1, s.length() - 1);
+        }
+        return s;
+    }
+
+    /** 确保路径以 / 开头，末尾不加 /。空字符串原样返回。 */
+    private static String normalizePath(String path) {
+        if (path == null || path.isEmpty()) return "";
+        if (!path.startsWith("/")) path = "/" + path;
+        if (path.endsWith("/") && path.length() > 1) path = path.substring(0, path.length() - 1);
+        return path;
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
     // 引用链分析（死代码检测：找出引用方，判断引用方是否有活跃入口，可否删除）
     // ──────────────────────────────────────────────────────────────────────────
 

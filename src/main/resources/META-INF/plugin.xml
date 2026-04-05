@@ -81,6 +81,14 @@
                           relative-to-action="com.example.plugin.FindPackageReferencesPreview"/>
         </action>
 
+        <action id="com.example.plugin.FindPackageWithControllerPreview"
+                class="com.example.plugin.action.FindPackageWithControllerPreviewAction"
+                text="查找包内引用(含Controller接口检查)(预览CSV)"
+                description="查找包内所有类及方法的引用，并检查每条引用位置是否为 RestController/Controller 接口方法，若是则输出完整 HTTP 接口路径，结果在 Tool Window 中预览">
+            <add-to-group group-id="ProjectViewPopupMenu" anchor="after"
+                          relative-to-action="com.example.plugin.FindPackageWithCachePreview"/>
+        </action>
+
         <action id="com.example.plugin.AnalyzePackageChainPreview"
                 class="com.example.plugin.action.AnalyzePackageChainPreviewAction"
                 text="分析包内引用链 (预览CSV)"
