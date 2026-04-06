@@ -737,6 +737,87 @@ public class ReferenceFinderUtil {
     }
 
     // ──────────────────────────────────────────────────────────────────────────
+    // 包内仅方法引用 + 调用方被引用检查
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /**
+     * 查找包内所有类的所有方法被引用的位置，并检查每条引用的调用方方法自身是否被其他代码调用。
+     *
+     * <p>只处理方法级别引用（跳过类级别），因此引用位置一定是某个具体方法，列值只有"是"/"否"。
+     *
+     * <p>输出 5 列：
+     * <ol>
+     *   <li>源类（方法签名）</li>
+     *   <li>目标项目</li>
+     *   <li>目标模块</li>
+     *   <li>引用位置（调用方方法签名）</li>
+     *   <li>引用位置方法是否被引用：{@code "是"} / {@code "否"}</li>
+     * </ol>
+     */
+    public static List<String[]> findPackageMethodRefsWithCallerCheck(
+            List<PsiClass> classes, ProgressIndicator indicator) {
+        List<String[]> results = new ArrayList<>();
+
+        for (PsiClass sourceClass : classes) {
+            List<PsiMethod> methods = ReadAction.compute(() ->
+                    Arrays.asList(sourceClass.getMethods()));
+
+            for (PsiMethod sourceMethod : methods) {
+                String[] sourceInfo = ReadAction.compute(() -> {
+                    String qn = sourceClass.getQualifiedName();
+                    if (qn == null) return null;
+                    return new String[]{qn, getMethodSignature(sourceMethod)};
+                });
+                if (sourceInfo == null) continue;
+                String methodSig = sourceInfo[1];
+
+                if (indicator != null) {
+                    indicator.setText("查找方法引用(调用方检查): " + methodSig);
+                    if (indicator.isCanceled()) break;
+                }
+
+                for (Project project : ProjectManager.getInstance().getOpenProjects()) {
+                    if (indicator != null && indicator.isCanceled()) break;
+
+                    PsiMethod targetMethod = ReadAction.compute(() -> {
+                        JavaPsiFacade f = JavaPsiFacade.getInstance(project);
+                        PsiClass cls = f.findClass(sourceInfo[0], GlobalSearchScope.allScope(project));
+                        return cls == null ? null : findMatchingMethod(cls, sourceMethod);
+                    });
+                    if (targetMethod == null) continue;
+                    String projectName = project.getName();
+
+                    ReferencesSearch.search(targetMethod, GlobalSearchScope.projectScope(project))
+                            .forEach(ref -> {
+                                if (indicator != null && indicator.isCanceled()) return false;
+
+                                String[] row = ReadAction.compute(() -> {
+                                    PsiElement refEl = ref.getElement();
+                                    PsiMethod caller = PsiTreeUtil.getParentOfType(refEl, PsiMethod.class);
+                                    if (caller == null) return null; // 非方法体内引用，跳过
+                                    Module module = ModuleUtilCore.findModuleForPsiElement(refEl);
+                                    String moduleName = module != null ? module.getName() : "";
+                                    String location = getMethodSignature(caller);
+                                    return new String[]{moduleName, location};
+                                });
+                                if (row == null) return true;
+
+                                PsiMethod caller = ReadAction.compute(() ->
+                                        PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
+                                String callerReferenced = ReferencesSearch
+                                        .search(caller, GlobalSearchScope.projectScope(project))
+                                        .findFirst() != null ? "是" : "否";
+
+                                results.add(new String[]{methodSig, projectName, row[0], row[1], callerReferenced});
+                                return true;
+                            });
+                }
+            }
+        }
+        return results;
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
     // 引用链分析（死代码检测：找出引用方，判断引用方是否有活跃入口，可否删除）
     // ──────────────────────────────────────────────────────────────────────────
 
