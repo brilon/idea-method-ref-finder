@@ -89,6 +89,14 @@
                           relative-to-action="com.example.plugin.FindPackageWithCachePreview"/>
         </action>
 
+        <action id="com.example.plugin.FindPackageWithUsageCheckPreview"
+                class="com.example.plugin.action.FindPackageWithUsageCheckPreviewAction"
+                text="查找包内引用(含被引用检查)(预览CSV)"
+                description="查找包内所有类及方法的引用，并检查每条引用位置的方法/类自身在目标项目中是否有调用方（是/否），结果在 Tool Window 中预览">
+            <add-to-group group-id="ProjectViewPopupMenu" anchor="after"
+                          relative-to-action="com.example.plugin.FindPackageWithControllerPreview"/>
+        </action>
+
         <action id="com.example.plugin.AnalyzePackageChainPreview"
                 class="com.example.plugin.action.AnalyzePackageChainPreviewAction"
                 text="分析包内引用链 (预览CSV)"

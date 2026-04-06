@@ -602,6 +602,141 @@ public class ReferenceFinderUtil {
     }
 
     // ──────────────────────────────────────────────────────────────────────────
+    // 包引用 + 引用位置自身被引用检查
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /**
+     * 查找包内所有类及其方法的引用，并对每条引用的调用方检查：
+     * 该调用方法（或所在类）自身在目标项目中是否有调用方（即是否被其他代码引用）。
+     *
+     * <p>输出 5 列：
+     * <ol>
+     *   <li>引用位置是否被引用：{@code "是"} / {@code "否"} / {@code "-"}（拿不到方法或类时）</li>
+     *   <li>源类（全限定名或方法签名）</li>
+     *   <li>目标项目</li>
+     *   <li>目标模块</li>
+     *   <li>引用位置（调用方方法签名或文件名）</li>
+     * </ol>
+     */
+    public static List<String[]> findPackageReferencesWithUsageCheck(
+            List<PsiClass> classes, ProgressIndicator indicator) {
+        List<String[]> results = new ArrayList<>();
+
+        for (PsiClass sourceClass : classes) {
+            String qualifiedName = ReadAction.compute(() -> sourceClass.getQualifiedName());
+            if (qualifiedName == null) continue;
+
+            // ── 类级别引用 ──
+            if (indicator != null) {
+                indicator.setText("查找类引用(被引用检查): " + qualifiedName);
+                if (indicator.isCanceled()) break;
+            }
+            for (Project project : ProjectManager.getInstance().getOpenProjects()) {
+                if (indicator != null && indicator.isCanceled()) break;
+                PsiClass targetClass = ReadAction.compute(() ->
+                        JavaPsiFacade.getInstance(project)
+                                .findClass(qualifiedName, GlobalSearchScope.allScope(project)));
+                if (targetClass == null) continue;
+                String projectName = project.getName();
+
+                ReferencesSearch.search(targetClass, GlobalSearchScope.projectScope(project))
+                        .forEach(ref -> {
+                            if (indicator != null && indicator.isCanceled()) return false;
+                            results.add(buildUsageCheckRow(qualifiedName, projectName, project, ref));
+                            return true;
+                        });
+            }
+
+            // ── 方法级别引用 ──
+            List<PsiMethod> methods = ReadAction.compute(() ->
+                    Arrays.asList(sourceClass.getMethods()));
+
+            for (PsiMethod sourceMethod : methods) {
+                String[] sourceInfo = ReadAction.compute(() -> {
+                    String qn = sourceClass.getQualifiedName();
+                    if (qn == null) return null;
+                    return new String[]{qn, getMethodSignature(sourceMethod)};
+                });
+                if (sourceInfo == null) continue;
+                String methodSig = sourceInfo[1];
+
+                if (indicator != null) {
+                    indicator.setText("查找方法引用(被引用检查): " + methodSig);
+                    if (indicator.isCanceled()) break;
+                }
+
+                for (Project project : ProjectManager.getInstance().getOpenProjects()) {
+                    if (indicator != null && indicator.isCanceled()) break;
+                    PsiMethod targetMethod = ReadAction.compute(() -> {
+                        JavaPsiFacade f = JavaPsiFacade.getInstance(project);
+                        PsiClass cls = f.findClass(sourceInfo[0], GlobalSearchScope.allScope(project));
+                        return cls == null ? null : findMatchingMethod(cls, sourceMethod);
+                    });
+                    if (targetMethod == null) continue;
+                    String projectName = project.getName();
+
+                    ReferencesSearch.search(targetMethod, GlobalSearchScope.projectScope(project))
+                            .forEach(ref -> {
+                                if (indicator != null && indicator.isCanceled()) return false;
+                                results.add(buildUsageCheckRow(methodSig, projectName, project, ref));
+                                return true;
+                            });
+                }
+            }
+        }
+        return results;
+    }
+
+    /** 构造一行被引用检查结果：{引用位置是否被引用, 源目标, 项目, 模块, 引用位置}。 */
+    private static String[] buildUsageCheckRow(String sourceLabel, String projectName,
+                                               Project project, PsiReference ref) {
+        String[] meta = ReadAction.compute(() -> {
+            PsiElement refElement = ref.getElement();
+            Module module = ModuleUtilCore.findModuleForPsiElement(refElement);
+            String moduleName = module != null ? module.getName() : "";
+            PsiMethod callerMethod = PsiTreeUtil.getParentOfType(refElement, PsiMethod.class);
+            String location = callerMethod != null
+                    ? getMethodSignature(callerMethod)
+                    : (refElement.getContainingFile() != null
+                            ? refElement.getContainingFile().getName()
+                            : "(unknown)");
+            return new String[]{moduleName, location};
+        });
+
+        String usageFlag = isCallerReferenced(ref, project);
+        return new String[]{usageFlag, sourceLabel, projectName, meta[0], meta[1]};
+    }
+
+    /**
+     * 判断引用元素所在的方法（或类）自身在目标项目中是否有调用方。
+     *
+     * <p>逻辑：
+     * <ul>
+     *   <li>引用位于某方法体内 → 检查该方法在项目范围内是否有引用</li>
+     *   <li>否则（import / 字段 / 类级别）→ 检查所在类是否有引用</li>
+     *   <li>拿不到方法或类 → 返回 {@code "-"}</li>
+     * </ul>
+     *
+     * @return {@code "是"} / {@code "否"} / {@code "-"}
+     */
+    private static String isCallerReferenced(PsiReference ref, Project project) {
+        PsiMethod callerMethod = ReadAction.compute(() ->
+                PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
+
+        if (callerMethod != null) {
+            return ReferencesSearch.search(callerMethod, GlobalSearchScope.projectScope(project))
+                    .findFirst() != null ? "是" : "否";
+        }
+
+        PsiClass containingClass = ReadAction.compute(() ->
+                PsiTreeUtil.getParentOfType(ref.getElement(), PsiClass.class));
+        if (containingClass == null) return "-";
+
+        return ReferencesSearch.search(containingClass, GlobalSearchScope.projectScope(project))
+                .findFirst() != null ? "是" : "否";
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
     // 引用链分析（死代码检测：找出引用方，判断引用方是否有活跃入口，可否删除）
     // ──────────────────────────────────────────────────────────────────────────
 
