@@ -105,6 +105,14 @@
                           relative-to-action="com.example.plugin.FindPackageWithUsageCheckPreview"/>
         </action>
 
+        <action id="com.example.plugin.FindPackageClassRefsWithImportCheckPreview"
+                class="com.example.plugin.action.FindPackageClassRefsWithImportCheckPreviewAction"
+                text="查找包内类引用(含import清理检查)(预览CSV)"
+                description="查找包内所有类被引用的位置（仅类级别），并检查每条引用处的 import 是否可以清理（是/否），结果在 Tool Window 中预览">
+            <add-to-group group-id="ProjectViewPopupMenu" anchor="after"
+                          relative-to-action="com.example.plugin.FindPackageMethodsWithCallerCheckPreview"/>
+        </action>
+
         <action id="com.example.plugin.AnalyzePackageChainPreview"
                 class="com.example.plugin.action.AnalyzePackageChainPreviewAction"
                 text="分析包内引用链 (预览CSV)"

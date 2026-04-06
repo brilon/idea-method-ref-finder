@@ -818,6 +818,103 @@ public class ReferenceFinderUtil {
     }
 
     // ──────────────────────────────────────────────────────────────────────────
+    // 包内仅类引用 + import 能否清理检查
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /**
+     * 查找包内所有类被引用的位置（仅类级别引用），并检查每条引用处的 import 是否可以清理。
+     *
+     * <p>判断规则：
+     * <ul>
+     *   <li>引用元素位于 import 语句内 → 在同一文件 scope 内再次搜索该类的所有引用，
+     *       若除 import 外无其他实际用法则可清理（{@code "是"}），否则 {@code "否"}</li>
+     *   <li>引用元素为实际代码用法（字段类型、方法参数、方法体等）→ {@code "否"}</li>
+     * </ul>
+     *
+     * <p>输出 5 列：
+     * <ol>
+     *   <li>源类（全限定名）</li>
+     *   <li>目标项目</li>
+     *   <li>目标模块</li>
+     *   <li>引用位置（调用方方法签名或文件名）</li>
+     *   <li>能否清理import：{@code "是"} / {@code "否"}</li>
+     * </ol>
+     */
+    public static List<String[]> findPackageClassRefsWithImportCheck(
+            List<PsiClass> classes, ProgressIndicator indicator) {
+        List<String[]> results = new ArrayList<>();
+
+        for (PsiClass sourceClass : classes) {
+            String qualifiedName = ReadAction.compute(() -> sourceClass.getQualifiedName());
+            if (qualifiedName == null) continue;
+
+            if (indicator != null) {
+                indicator.setText("查找类引用(import清理检查): " + qualifiedName);
+                if (indicator.isCanceled()) break;
+            }
+
+            for (Project project : ProjectManager.getInstance().getOpenProjects()) {
+                if (indicator != null && indicator.isCanceled()) break;
+
+                PsiClass targetClass = ReadAction.compute(() ->
+                        JavaPsiFacade.getInstance(project)
+                                .findClass(qualifiedName, GlobalSearchScope.allScope(project)));
+                if (targetClass == null) continue;
+                String projectName = project.getName();
+
+                ReferencesSearch.search(targetClass, GlobalSearchScope.projectScope(project))
+                        .forEach(ref -> {
+                            if (indicator != null && indicator.isCanceled()) return false;
+
+                            String[] meta = ReadAction.compute(() -> {
+                                PsiElement refEl = ref.getElement();
+                                Module module = ModuleUtilCore.findModuleForPsiElement(refEl);
+                                String moduleName = module != null ? module.getName() : "";
+                                PsiMethod callerMethod = PsiTreeUtil.getParentOfType(
+                                        refEl, PsiMethod.class);
+                                String location = callerMethod != null
+                                        ? getMethodSignature(callerMethod)
+                                        : (refEl.getContainingFile() != null
+                                                ? refEl.getContainingFile().getName()
+                                                : "(unknown)");
+                                return new String[]{moduleName, location};
+                            });
+
+                            String canCleanImport = resolveImportCleanable(ref, targetClass);
+                            results.add(new String[]{
+                                    qualifiedName, projectName, meta[0], meta[1], canCleanImport});
+                            return true;
+                        });
+            }
+        }
+        return results;
+    }
+
+    /**
+     * 判断该引用处的 import 是否可以清理。
+     *
+     * @return {@code "是"} 可清理 / {@code "否"} 不可清理
+     */
+    private static String resolveImportCleanable(PsiReference ref, PsiClass targetClass) {
+        // 判断引用是否位于 import 语句内
+        boolean isImport = ReadAction.compute(() ->
+                PsiTreeUtil.getParentOfType(ref.getElement(), PsiImportStatement.class) != null);
+
+        if (!isImport) return "否"; // 实际代码用法，import 不可清理
+
+        // 在同一文件内搜索该类的所有引用，看是否存在非 import 的实际用法
+        PsiFile file = ReadAction.compute(() -> ref.getElement().getContainingFile());
+        if (file == null) return "否";
+
+        boolean hasActualUsage = ReferencesSearch
+                .search(targetClass, GlobalSearchScope.fileScope(file))
+                .anyMatch(r -> ReadAction.compute(() ->
+                        PsiTreeUtil.getParentOfType(r.getElement(), PsiImportStatement.class) == null));
+
+        return hasActualUsage ? "否" : "是";
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
     // 引用链分析（死代码检测：找出引用方，判断引用方是否有活跃入口，可否删除）
     // ──────────────────────────────────────────────────────────────────────────
 
