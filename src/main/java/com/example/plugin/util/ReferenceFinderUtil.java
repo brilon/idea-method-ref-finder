@@ -1450,82 +1450,84 @@ public class ReferenceFinderUtil {
                 if (indicator.isCanceled()) break;
             }
 
-            // ── 在所有已打开项目中查找对应 PsiMethod ──
-            PsiMethod sourceMethod = null;
+            // ── 在所有已打开项目中查找对应 PsiMethod（支持多重载）──
+            List<PsiMethod> sourceMethods = new ArrayList<>();
             for (Project project : ProjectManager.getInstance().getOpenProjects()) {
                 final String sig = signature;
-                PsiMethod found = ReadAction.compute(() -> findMethodBySignature(sig, project));
-                if (found != null) {
-                    sourceMethod = found;
-                    break;
+                List<PsiMethod> found = ReadAction.compute(() -> findMethodsBySignature(sig, project));
+                if (!found.isEmpty()) {
+                    sourceMethods.addAll(found);
+                    break; // 同一个类在多个项目中出现时只取第一个项目
                 }
             }
 
-            if (sourceMethod == null) {
+            if (sourceMethods.isEmpty()) {
                 results.add(new String[]{signature, "(未在任何已打开项目中找到该方法)", "", ""});
                 continue;
             }
 
-            final PsiMethod finalSourceMethod = sourceMethod;
+            for (PsiMethod sourceMethod : sourceMethods) {
+                final PsiMethod finalSourceMethod = sourceMethod;
 
-            // ── 源方法带出处标签注释 ──
-            String sourceAnnotatedComments = ReadAction.compute(() -> {
-                List<String> entries = getAnnotatedMethodComments(finalSourceMethod, "");
-                return String.join(" | ", entries);
-            });
-
-            String sourceSignature = ReadAction.compute(() -> getMethodSignature(finalSourceMethod));
-            String qualifiedClassName = ReadAction.compute(() -> {
-                PsiClass cls = finalSourceMethod.getContainingClass();
-                return cls != null ? cls.getQualifiedName() : null;
-            });
-            if (qualifiedClassName == null) continue;
-
-            // ── 在各已打开项目中查找引用 ──
-            for (Project project : ProjectManager.getInstance().getOpenProjects()) {
-                if (indicator != null && indicator.isCanceled()) break;
-
-                PsiMethod targetMethod = ReadAction.compute(() -> {
-                    PsiClass cls = JavaPsiFacade.getInstance(project)
-                            .findClass(qualifiedClassName, GlobalSearchScope.allScope(project));
-                    return cls == null ? null : findMatchingMethod(cls, finalSourceMethod);
+                // ── 源方法带出处标签注释 ──
+                String sourceAnnotatedComments = ReadAction.compute(() -> {
+                    List<String> entries = getAnnotatedMethodComments(finalSourceMethod, "");
+                    return String.join(" | ", entries);
                 });
-                if (targetMethod == null) continue;
 
-                ReferencesSearch.search(targetMethod, GlobalSearchScope.projectScope(project))
-                        .forEach(ref -> {
-                            if (indicator != null && indicator.isCanceled()) return false;
+                String sourceSignature = ReadAction.compute(() -> getMethodSignature(finalSourceMethod));
+                String qualifiedClassName = ReadAction.compute(() -> {
+                    PsiClass cls = finalSourceMethod.getContainingClass();
+                    return cls != null ? cls.getQualifiedName() : null;
+                });
+                if (qualifiedClassName == null) continue;
 
-                            PsiMethod callerMethod = ReadAction.compute(() ->
-                                    PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
+                // ── 在各已打开项目中查找引用 ──
+                for (Project project : ProjectManager.getInstance().getOpenProjects()) {
+                    if (indicator != null && indicator.isCanceled()) break;
 
-                            String callerSig = ReadAction.compute(() -> {
-                                if (callerMethod != null) return getMethodSignature(callerMethod);
-                                PsiFile file = ref.getElement().getContainingFile();
-                                return file != null ? file.getName() : "(unknown)";
-                            });
+                    PsiMethod targetMethod = ReadAction.compute(() -> {
+                        PsiClass cls = JavaPsiFacade.getInstance(project)
+                                .findClass(qualifiedClassName, GlobalSearchScope.allScope(project));
+                        return cls == null ? null : findMatchingMethod(cls, finalSourceMethod);
+                    });
+                    if (targetMethod == null) continue;
 
-                            // ── 引用链带出处标签注释（最多 chainDepth 层）──
-                            List<String> chainEntries = new ArrayList<>();
-                            if (callerMethod != null) {
-                                collectAnnotatedChainComments(
-                                        callerMethod, 1, chainDepth, new HashSet<>(), chainEntries);
-                            } else {
-                                // 非方法体引用（import / 字段 / 类级别）→ 取所在类注释
-                                String classComment = ReadAction.compute(() -> {
-                                    PsiClass cls = PsiTreeUtil.getParentOfType(
-                                            ref.getElement(), PsiClass.class);
-                                    if (cls == null) return "";
-                                    String text = getClassComment(cls);
-                                    return text.isEmpty() ? "" : "[类: " + (cls.getName() != null ? cls.getName() : "") + "] " + text;
+                    ReferencesSearch.search(targetMethod, GlobalSearchScope.projectScope(project))
+                            .forEach(ref -> {
+                                if (indicator != null && indicator.isCanceled()) return false;
+
+                                PsiMethod callerMethod = ReadAction.compute(() ->
+                                        PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
+
+                                String callerSig = ReadAction.compute(() -> {
+                                    if (callerMethod != null) return getMethodSignature(callerMethod);
+                                    PsiFile file = ref.getElement().getContainingFile();
+                                    return file != null ? file.getName() : "(unknown)";
                                 });
-                                if (!classComment.isEmpty()) chainEntries.add(classComment);
-                            }
-                            String chainComments = String.join(" | ", chainEntries);
 
-                            results.add(new String[]{sourceSignature, sourceAnnotatedComments, callerSig, chainComments});
-                            return true;
-                        });
+                                // ── 引用链带出处标签注释（最多 chainDepth 层）──
+                                List<String> chainEntries = new ArrayList<>();
+                                if (callerMethod != null) {
+                                    collectAnnotatedChainComments(
+                                            callerMethod, 1, chainDepth, new HashSet<>(), chainEntries);
+                                } else {
+                                    // 非方法体引用（import / 字段 / 类级别）→ 取所在类注释
+                                    String classComment = ReadAction.compute(() -> {
+                                        PsiClass cls = PsiTreeUtil.getParentOfType(
+                                                ref.getElement(), PsiClass.class);
+                                        if (cls == null) return "";
+                                        String text = getClassComment(cls);
+                                        return text.isEmpty() ? "" : "[类: " + (cls.getName() != null ? cls.getName() : "") + "] " + text;
+                                    });
+                                    if (!classComment.isEmpty()) chainEntries.add(classComment);
+                                }
+                                String chainComments = String.join(" | ", chainEntries);
+
+                                results.add(new String[]{sourceSignature, sourceAnnotatedComments, callerSig, chainComments});
+                                return true;
+                            });
+                }
             }
         }
         return results;
@@ -1647,31 +1649,45 @@ public class ReferenceFinderUtil {
     }
 
     /**
-     * 根据签名字符串在指定项目中查找对应的 PsiMethod。
+     * 根据签名字符串在指定项目中查找匹配的 PsiMethod 列表。
      *
-     * <p>签名格式：{@code com.example.ClassName#methodName(param1Type, param2Type)}
+     * <p>支持两种格式：
+     * <ul>
+     *   <li>带参数：{@code com.example.ClassName#methodName(param1Type, param2Type)} — 精确匹配</li>
+     *   <li>无参数：{@code com.example.ClassName#methodName} — 按方法名匹配，返回所有重载</li>
+     * </ul>
      *
      * <p>调用方必须持有 ReadAction。
      *
-     * @return 找到的 PsiMethod，未找到时返回 null
+     * @return 匹配的方法列表，未找到时返回空列表
      */
-    private static PsiMethod findMethodBySignature(String signature, Project project) {
+    private static List<PsiMethod> findMethodsBySignature(String signature, Project project) {
         int hashIdx = signature.indexOf('#');
-        if (hashIdx < 0) return null;
+        if (hashIdx < 0) return Collections.emptyList();
         String className = signature.substring(0, hashIdx).trim();
         String methodPart = signature.substring(hashIdx + 1).trim();
 
-        int parenStart = methodPart.indexOf('(');
-        int parenEnd = methodPart.lastIndexOf(')');
-        if (parenStart < 0 || parenEnd < 0 || parenEnd < parenStart) return null;
-
-        String methodName = methodPart.substring(0, parenStart).trim();
-        String paramsStr = methodPart.substring(parenStart + 1, parenEnd).trim();
-        String[] paramTypes = paramsStr.isEmpty() ? new String[0] : paramsStr.split(",\\s*");
-
         PsiClass psiClass = JavaPsiFacade.getInstance(project)
                 .findClass(className, GlobalSearchScope.allScope(project));
-        if (psiClass == null) return null;
+        if (psiClass == null) return Collections.emptyList();
+
+        int parenStart = methodPart.indexOf('(');
+        int parenEnd   = methodPart.lastIndexOf(')');
+
+        // 无括号：按方法名匹配所有重载
+        if (parenStart < 0 || parenEnd < 0 || parenEnd < parenStart) {
+            String methodName = methodPart.trim();
+            List<PsiMethod> matched = new ArrayList<>();
+            for (PsiMethod m : psiClass.getMethods()) {
+                if (m.getName().equals(methodName)) matched.add(m);
+            }
+            return matched;
+        }
+
+        // 有括号：精确匹配（方法名 + 参数类型）
+        String methodName = methodPart.substring(0, parenStart).trim();
+        String paramsStr  = methodPart.substring(parenStart + 1, parenEnd).trim();
+        String[] paramTypes = paramsStr.isEmpty() ? new String[0] : paramsStr.split(",\\s*");
 
         outer:
         for (PsiMethod method : psiClass.getMethods()) {
@@ -1681,9 +1697,9 @@ public class ReferenceFinderUtil {
             for (int i = 0; i < params.length; i++) {
                 if (!params[i].getType().getCanonicalText().equals(paramTypes[i].trim())) continue outer;
             }
-            return method;
+            return Collections.singletonList(method);
         }
-        return null;
+        return Collections.emptyList();
     }
 
     /**
