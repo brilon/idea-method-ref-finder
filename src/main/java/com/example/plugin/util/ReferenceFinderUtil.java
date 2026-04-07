@@ -1418,6 +1418,274 @@ public class ReferenceFinderUtil {
         }
     }
 
+    // ──────────────────────────────────────────────────────────────────────────
+    // 输入签名 → 带出处标签的引用注释分析
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /**
+     * 根据输入的方法签名列表，在所有已打开项目中查找每个方法的引用，
+     * 并为每条引用输出：源方法带出处标签注释 + 引用位置 + 引用链带出处标签注释（最多 chainDepth 层）。
+     *
+     * <p>注释格式示例：
+     * <ul>
+     *   <li>源方法注释列：{@code [自身] 方法注释 | [接口: IFoo#bar] 接口注释 | [父类: Base#bar] 父类注释}</li>
+     *   <li>引用链注释列：{@code [L1: ServiceImpl#process] 注释 | [L1接口: IService#process] 注释 | [L2: Controller#exec] 注释}</li>
+     * </ul>
+     *
+     * @param signatures 方法签名字符串列表，格式 {@code com.example.ClassName#methodName(param1Type, param2Type)}
+     * @param chainDepth 引用链追溯层数上限（建议 3）
+     * @param indicator  进度指示器，可为 null
+     * @return 每条记录为 String[4]：{源方法签名, 源方法注释, 引用位置, 引用链注释}
+     */
+    public static List<String[]> findInputMethodRefsWithAnnotatedComments(
+            List<String> signatures, int chainDepth, ProgressIndicator indicator) {
+        List<String[]> results = new ArrayList<>();
+
+        for (String rawSig : signatures) {
+            String signature = rawSig.trim();
+            if (signature.isEmpty()) continue;
+
+            if (indicator != null) {
+                indicator.setText("分析: " + signature);
+                if (indicator.isCanceled()) break;
+            }
+
+            // ── 在所有已打开项目中查找对应 PsiMethod ──
+            PsiMethod sourceMethod = null;
+            for (Project project : ProjectManager.getInstance().getOpenProjects()) {
+                final String sig = signature;
+                PsiMethod found = ReadAction.compute(() -> findMethodBySignature(sig, project));
+                if (found != null) {
+                    sourceMethod = found;
+                    break;
+                }
+            }
+
+            if (sourceMethod == null) {
+                results.add(new String[]{signature, "(未在任何已打开项目中找到该方法)", "", ""});
+                continue;
+            }
+
+            final PsiMethod finalSourceMethod = sourceMethod;
+
+            // ── 源方法带出处标签注释 ──
+            String sourceAnnotatedComments = ReadAction.compute(() -> {
+                List<String> entries = getAnnotatedMethodComments(finalSourceMethod, "");
+                return String.join(" | ", entries);
+            });
+
+            String sourceSignature = ReadAction.compute(() -> getMethodSignature(finalSourceMethod));
+            String qualifiedClassName = ReadAction.compute(() -> {
+                PsiClass cls = finalSourceMethod.getContainingClass();
+                return cls != null ? cls.getQualifiedName() : null;
+            });
+            if (qualifiedClassName == null) continue;
+
+            // ── 在各已打开项目中查找引用 ──
+            for (Project project : ProjectManager.getInstance().getOpenProjects()) {
+                if (indicator != null && indicator.isCanceled()) break;
+
+                PsiMethod targetMethod = ReadAction.compute(() -> {
+                    PsiClass cls = JavaPsiFacade.getInstance(project)
+                            .findClass(qualifiedClassName, GlobalSearchScope.allScope(project));
+                    return cls == null ? null : findMatchingMethod(cls, finalSourceMethod);
+                });
+                if (targetMethod == null) continue;
+
+                ReferencesSearch.search(targetMethod, GlobalSearchScope.projectScope(project))
+                        .forEach(ref -> {
+                            if (indicator != null && indicator.isCanceled()) return false;
+
+                            PsiMethod callerMethod = ReadAction.compute(() ->
+                                    PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
+
+                            String callerSig = ReadAction.compute(() -> {
+                                if (callerMethod != null) return getMethodSignature(callerMethod);
+                                PsiFile file = ref.getElement().getContainingFile();
+                                return file != null ? file.getName() : "(unknown)";
+                            });
+
+                            // ── 引用链带出处标签注释（最多 chainDepth 层）──
+                            List<String> chainEntries = new ArrayList<>();
+                            if (callerMethod != null) {
+                                collectAnnotatedChainComments(
+                                        callerMethod, 1, chainDepth, new HashSet<>(), chainEntries);
+                            } else {
+                                // 非方法体引用（import / 字段 / 类级别）→ 取所在类注释
+                                String classComment = ReadAction.compute(() -> {
+                                    PsiClass cls = PsiTreeUtil.getParentOfType(
+                                            ref.getElement(), PsiClass.class);
+                                    if (cls == null) return "";
+                                    String text = getClassComment(cls);
+                                    return text.isEmpty() ? "" : "[类: " + (cls.getName() != null ? cls.getName() : "") + "] " + text;
+                                });
+                                if (!classComment.isEmpty()) chainEntries.add(classComment);
+                            }
+                            String chainComments = String.join(" | ", chainEntries);
+
+                            results.add(new String[]{sourceSignature, sourceAnnotatedComments, callerSig, chainComments});
+                            return true;
+                        });
+            }
+        }
+        return results;
+    }
+
+    /**
+     * 递归收集方法（及其接口/父类方法）的带出处标签注释，向上追溯至 maxLevel 层。
+     *
+     * <p>每层注释格式：{@code [Ln: ClassName#method] 注释 | [Ln接口: IFace#m] 注释 | [Ln父类: Base#m] 注释}
+     *
+     * @param method     当前层方法
+     * @param level      当前层级（从 1 开始，1 = 直接引用方）
+     * @param maxLevel   最大追溯层数
+     * @param visited    已访问方法签名集合（避免循环）
+     * @param result     收集到的注释条目列表（按追溯顺序追加）
+     */
+    private static void collectAnnotatedChainComments(
+            PsiMethod method, int level, int maxLevel,
+            Set<String> visited, List<String> result) {
+
+        if (level > maxLevel) return;
+
+        String sig = ReadAction.compute(() -> getMethodSignature(method));
+        if (visited.contains(sig)) return;
+        visited.add(sig);
+
+        // 获取本层方法的带标签注释
+        String prefix = "L" + level;
+        List<String> ownEntries = ReadAction.compute(() -> getAnnotatedMethodComments(method, prefix));
+        result.addAll(ownEntries);
+
+        // 若未到上限，继续向上追溯调用方
+        if (level < maxLevel) {
+            for (Project project : ProjectManager.getInstance().getOpenProjects()) {
+                PsiMethod target = ReadAction.compute(() -> {
+                    PsiClass cls = method.getContainingClass();
+                    if (cls == null) return null;
+                    String qn = cls.getQualifiedName();
+                    if (qn == null) return null;
+                    PsiClass targetCls = JavaPsiFacade.getInstance(project)
+                            .findClass(qn, GlobalSearchScope.allScope(project));
+                    return targetCls == null ? null : findMatchingMethod(targetCls, method);
+                });
+                if (target == null) continue;
+
+                List<PsiMethod> callers = new ArrayList<>();
+                ReferencesSearch.search(target, GlobalSearchScope.projectScope(project))
+                        .forEach(ref -> {
+                            PsiMethod caller = ReadAction.compute(() ->
+                                    PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
+                            if (caller != null) callers.add(caller);
+                            return true;
+                        });
+
+                for (PsiMethod caller : callers) {
+                    collectAnnotatedChainComments(caller, level + 1, maxLevel, new HashSet<>(visited), result);
+                }
+            }
+        }
+    }
+
+    /**
+     * 获取方法的带出处标签注释列表（自身 Javadoc + 接口 Javadoc + 父类 Javadoc）。
+     *
+     * <p>标签格式：
+     * <ul>
+     *   <li>源方法层（prefix 为 ""）：{@code [自身]}、{@code [接口: IFoo#m]}、{@code [父类: Base#m]}</li>
+     *   <li>引用链层（prefix 为 "L1" 等）：{@code [L1: Class#m]}、{@code [L1接口: IFoo#m]}、{@code [L1父类: Base#m]}</li>
+     * </ul>
+     *
+     * <p>调用方必须持有 ReadAction。
+     *
+     * @param method      目标方法
+     * @param levelPrefix 层级前缀，空串表示源方法层，"L1"/"L2"/"L3" 表示引用链各层
+     */
+    private static List<String> getAnnotatedMethodComments(PsiMethod method, String levelPrefix) {
+        List<String> entries = new ArrayList<>();
+
+        // 自身注释
+        String selfLabel = levelPrefix.isEmpty()
+                ? "[自身]"
+                : "[" + levelPrefix + ": " + shortMethodSig(method) + "]";
+        PsiDocComment doc = method.getDocComment();
+        if (doc != null) {
+            String text = extractDocText(doc);
+            if (!text.isEmpty()) {
+                entries.add(selfLabel + " " + text);
+            }
+        }
+
+        // 接口 / 父类方法注释
+        for (PsiMethod superMethod : method.findSuperMethods()) {
+            PsiDocComment superDoc = superMethod.getDocComment();
+            if (superDoc == null) continue;
+            String text = extractDocText(superDoc);
+            if (text.isEmpty()) continue;
+
+            PsiClass superClass = superMethod.getContainingClass();
+            boolean isInterface = superClass != null && superClass.isInterface();
+            String kind = isInterface ? "接口" : "父类";
+            String superLabel = levelPrefix.isEmpty()
+                    ? "[" + kind + ": " + shortMethodSig(superMethod) + "]"
+                    : "[" + levelPrefix + kind + ": " + shortMethodSig(superMethod) + "]";
+            entries.add(superLabel + " " + text);
+        }
+
+        return entries;
+    }
+
+    /**
+     * 返回方法的短签名 {@code ClassName#methodName}（不含包名和参数），用于注释标签。
+     *
+     * <p>调用方必须持有 ReadAction。
+     */
+    private static String shortMethodSig(PsiMethod method) {
+        PsiClass cls = method.getContainingClass();
+        String className = (cls != null && cls.getName() != null) ? cls.getName() : "";
+        return className + "#" + method.getName();
+    }
+
+    /**
+     * 根据签名字符串在指定项目中查找对应的 PsiMethod。
+     *
+     * <p>签名格式：{@code com.example.ClassName#methodName(param1Type, param2Type)}
+     *
+     * <p>调用方必须持有 ReadAction。
+     *
+     * @return 找到的 PsiMethod，未找到时返回 null
+     */
+    private static PsiMethod findMethodBySignature(String signature, Project project) {
+        int hashIdx = signature.indexOf('#');
+        if (hashIdx < 0) return null;
+        String className = signature.substring(0, hashIdx).trim();
+        String methodPart = signature.substring(hashIdx + 1).trim();
+
+        int parenStart = methodPart.indexOf('(');
+        int parenEnd = methodPart.lastIndexOf(')');
+        if (parenStart < 0 || parenEnd < 0 || parenEnd < parenStart) return null;
+
+        String methodName = methodPart.substring(0, parenStart).trim();
+        String paramsStr = methodPart.substring(parenStart + 1, parenEnd).trim();
+        String[] paramTypes = paramsStr.isEmpty() ? new String[0] : paramsStr.split(",\\s*");
+
+        PsiClass psiClass = JavaPsiFacade.getInstance(project)
+                .findClass(className, GlobalSearchScope.allScope(project));
+        if (psiClass == null) return null;
+
+        outer:
+        for (PsiMethod method : psiClass.getMethods()) {
+            if (!method.getName().equals(methodName)) continue;
+            PsiParameter[] params = method.getParameterList().getParameters();
+            if (params.length != paramTypes.length) continue;
+            for (int i = 0; i < params.length; i++) {
+                if (!params[i].getType().getCanonicalText().equals(paramTypes[i].trim())) continue outer;
+            }
+            return method;
+        }
+        return null;
+    }
+
     /**
      * 在目标类中查找与 sourceMethod 签名一致的方法（方法名 + 参数类型全限定名均匹配）。
      *

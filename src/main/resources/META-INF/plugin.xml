@@ -140,5 +140,12 @@
                 description="查找包（含子包）内所有类及其方法的跨项目引用，收集每条引用方法及其向上 4 层调用链的 Javadoc 注释（无注释时回退到接口/父类），拼接后在 Tool Window 中预览">
             <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
         </action>
+
+        <action id="com.example.plugin.InputMethodRefsWithCommentsPreview"
+                class="com.example.plugin.action.InputMethodRefsWithCommentsPreviewAction"
+                text="输入方法签名查引用注释 (预览CSV)"
+                description="输入多行方法签名，批量查找跨项目引用，输出源方法注释（含接口/父类来源）和引用链注释（最多 3 层，每层含接口/父类来源），结果在 Tool Window 中预览">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+        </action>
     </actions>
 </idea-plugin>
