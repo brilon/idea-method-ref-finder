@@ -213,16 +213,15 @@ public class ReferenceFinderUtil {
     // ──────────────────────────────────────────────────────────────────────────
 
     /**
-     * 查找包内所有类及其方法的引用，并对每条引用的调用方检查是否调用了含 "cache" 关键词的方法。
+     * 查找包内所有类及其方法的引用，并检查每条引用位置的方法体文本是否含 "cache" 关键词（不区分大小写）。
      *
-     * <p>输出 6 列：
+     * <p>输出 5 列：
      * <ol>
      *   <li>源类（全限定名或方法签名）</li>
      *   <li>目标项目</li>
      *   <li>目标模块</li>
      *   <li>引用位置（调用方方法签名或文件名）</li>
-     *   <li>含Cache方法：{@code "是"} / {@code "否"} / {@code "-"}（非方法体引用时）</li>
-     *   <li>Cache方法列表：含 cache 的被调用方法签名，以 {@code " | "} 分隔；无则 {@code "-"}</li>
+     *   <li>含cache关键词：{@code "是"} / {@code "否"} / {@code "-"}（非方法体引用时）</li>
      * </ol>
      */
     public static List<String[]> findPackageReferencesWithCacheCheck(
@@ -294,9 +293,9 @@ public class ReferenceFinderUtil {
         return results;
     }
 
-    /** 构造一行 cache 检查结果：{源目标, 项目, 模块, 引用位置, 含Cache方法, Cache方法列表}。 */
+    /** 构造一行 cache 检查结果：{源目标, 项目, 模块, 引用位置, 含cache关键词}。 */
     private static String[] buildCacheRow(String sourceLabel, String projectName, PsiReference ref) {
-        String[] meta = ReadAction.compute(() -> {
+        return ReadAction.compute(() -> {
             PsiElement refElement = ref.getElement();
             Module module = ModuleUtilCore.findModuleForPsiElement(refElement);
             String moduleName = module != null ? module.getName() : "";
@@ -306,44 +305,10 @@ public class ReferenceFinderUtil {
                     : (refElement.getContainingFile() != null
                             ? refElement.getContainingFile().getName()
                             : "(unknown)");
-            return new String[]{moduleName, location};
+            String cacheFlag = callerMethod == null ? "-"
+                    : (callerMethod.getText().toLowerCase().contains("cache") ? "是" : "否");
+            return new String[]{sourceLabel, projectName, moduleName, location, cacheFlag};
         });
-
-        PsiMethod callerMethod = ReadAction.compute(() ->
-                PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
-
-        String hasCacheFlag, cacheList;
-        if (callerMethod == null) {
-            hasCacheFlag = "-";
-            cacheList    = "-";
-        } else {
-            List<String> cacheCalls = ReadAction.compute(() ->
-                    findCacheCallsInMethod(callerMethod));
-            hasCacheFlag = cacheCalls.isEmpty() ? "否" : "是";
-            cacheList    = cacheCalls.isEmpty() ? "-" : String.join(" | ", cacheCalls);
-        }
-
-        return new String[]{sourceLabel, projectName, meta[0], meta[1], hasCacheFlag, cacheList};
-    }
-
-    /**
-     * 在方法体内查找所有方法名含 "cache"（不区分大小写）的调用，返回它们的签名列表。
-     *
-     * <p>调用方必须持有 ReadAction。
-     */
-    private static List<String> findCacheCallsInMethod(PsiMethod method) {
-        List<String> result = new ArrayList<>();
-        java.util.Collection<PsiMethodCallExpression> calls =
-                PsiTreeUtil.findChildrenOfType(method, PsiMethodCallExpression.class);
-        java.util.LinkedHashSet<String> seen = new java.util.LinkedHashSet<>();
-        for (PsiMethodCallExpression call : calls) {
-            String refName = call.getMethodExpression().getReferenceName();
-            if (refName == null || !refName.toLowerCase().contains("cache")) continue;
-            PsiMethod resolved = call.resolveMethod();
-            String sig = resolved != null ? getMethodSignature(resolved) : refName + "()";
-            if (seen.add(sig)) result.add(sig);
-        }
-        return result;
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -712,7 +677,8 @@ public class ReferenceFinderUtil {
      *
      * <p>逻辑：
      * <ul>
-     *   <li>引用位于某方法体内 → 检查该方法在项目范围内是否有引用</li>
+     *   <li>引用位于某方法体内 → 检查该方法在项目范围内是否有引用；
+     *       若无引用，再检查其上层接口方法及父类方法是否被引用</li>
      *   <li>否则（import / 字段 / 类级别）→ 检查所在类是否有引用</li>
      *   <li>拿不到方法或类 → 返回 {@code "-"}</li>
      * </ul>
@@ -724,8 +690,7 @@ public class ReferenceFinderUtil {
                 PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
 
         if (callerMethod != null) {
-            return ReferencesSearch.search(callerMethod, GlobalSearchScope.projectScope(project))
-                    .findFirst() != null ? "是" : "否";
+            return isMethodOrSuperReferenced(callerMethod, project) ? "是" : "否";
         }
 
         PsiClass containingClass = ReadAction.compute(() ->
@@ -734,6 +699,27 @@ public class ReferenceFinderUtil {
 
         return ReferencesSearch.search(containingClass, GlobalSearchScope.projectScope(project))
                 .findFirst() != null ? "是" : "否";
+    }
+
+    /**
+     * 检查方法自身是否被引用；若无引用，继续检查其所有上层接口方法和父类方法。
+     *
+     * <p>使用 {@link PsiMethod#findSuperMethods()} 获取直接上层方法（接口 + 父类均包含），
+     * 只要任意一层存在引用即视为"被引用"。
+     */
+    private static boolean isMethodOrSuperReferenced(PsiMethod method, Project project) {
+        GlobalSearchScope scope = GlobalSearchScope.projectScope(project);
+        if (ReferencesSearch.search(method, scope).findFirst() != null) {
+            return true;
+        }
+        // 检查上层接口方法 / 父类方法
+        PsiMethod[] superMethods = ReadAction.compute(method::findSuperMethods);
+        for (PsiMethod superMethod : superMethods) {
+            if (ReferencesSearch.search(superMethod, scope).findFirst() != null) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -804,9 +790,7 @@ public class ReferenceFinderUtil {
 
                                 PsiMethod caller = ReadAction.compute(() ->
                                         PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
-                                String callerReferenced = ReferencesSearch
-                                        .search(caller, GlobalSearchScope.projectScope(project))
-                                        .findFirst() != null ? "是" : "否";
+                                String callerReferenced = isMethodOrSuperReferenced(caller, project) ? "是" : "否";
 
                                 results.add(new String[]{methodSig, projectName, row[0], row[1], callerReferenced});
                                 return true;

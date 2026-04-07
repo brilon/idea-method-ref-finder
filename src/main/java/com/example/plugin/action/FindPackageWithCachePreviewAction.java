@@ -20,11 +20,11 @@ import java.util.List;
  * 项目视图右键菜单：查找包内所有类及其方法被引用的位置，
  * 并对每条引用的调用方检查是否调用了含 "cache" 关键词的方法，结果在 Tool Window 中预览。
  *
- * <p>输出列：源类, 目标项目, 目标模块, 引用位置, 含Cache方法(是/否/-), Cache方法列表
+ * <p>输出列：源类, 目标项目, 目标模块, 引用位置, 含cache关键词(是/否/-)
  */
 public class FindPackageWithCachePreviewAction extends AnAction {
 
-    static final String HEADER = "源类,目标项目,目标模块,引用位置,含Cache方法,Cache方法列表\n";
+    static final String HEADER = "源类,目标项目,目标模块,引用位置,含cache关键词\n";
 
     @Override
     public @NotNull ActionUpdateThread getActionUpdateThread() {
