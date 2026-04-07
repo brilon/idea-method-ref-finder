@@ -1590,13 +1590,17 @@ public class ReferenceFinderUtil {
     }
 
     /**
-     * 获取方法的带出处标签注释列表（自身 Javadoc + 接口 Javadoc + 父类 Javadoc）。
+     * 获取方法的带出处标签注释列表，涵盖类/接口级别注释和方法级别注释。
      *
-     * <p>标签格式：
-     * <ul>
-     *   <li>源方法层（prefix 为 ""）：{@code [自身]}、{@code [接口: IFoo#m]}、{@code [父类: Base#m]}</li>
-     *   <li>引用链层（prefix 为 "L1" 等）：{@code [L1: Class#m]}、{@code [L1接口: IFoo#m]}、{@code [L1父类: Base#m]}</li>
-     * </ul>
+     * <p>输出顺序（由大到小）：
+     * <ol>
+     *   <li>所在类（或接口）自身的 Javadoc</li>
+     *   <li>所在类实现的各接口的 Javadoc</li>
+     *   <li>所在类的父类 Javadoc（排除 {@code java.lang.Object}）</li>
+     *   <li>方法自身 Javadoc</li>
+     *   <li>方法在接口中的 Javadoc</li>
+     *   <li>方法在父类中的 Javadoc</li>
+     * </ol>
      *
      * <p>调用方必须持有 ReadAction。
      *
@@ -1605,33 +1609,55 @@ public class ReferenceFinderUtil {
      */
     private static List<String> getAnnotatedMethodComments(PsiMethod method, String levelPrefix) {
         List<String> entries = new ArrayList<>();
+        String p = levelPrefix;
 
-        // 自身注释
-        String selfLabel = levelPrefix.isEmpty()
-                ? "[自身]"
-                : "[" + levelPrefix + ": " + shortMethodSig(method) + "]";
-        PsiDocComment doc = method.getDocComment();
-        if (doc != null) {
-            String text = extractDocText(doc);
-            if (!text.isEmpty()) {
-                entries.add(selfLabel + " " + text);
+        PsiClass containingClass = method.getContainingClass();
+
+        // ── 1. 类/接口级别注释 ──
+        if (containingClass != null) {
+            // 所在类（或接口）自身
+            String classDoc = getClassComment(containingClass);
+            if (!classDoc.isEmpty()) {
+                String kind = containingClass.isInterface() ? "所在接口" : "所在类";
+                String name = containingClass.getName() != null ? containingClass.getName() : "";
+                entries.add("[" + p + kind + ": " + name + "] " + classDoc);
+            }
+            // 所在类实现的各接口
+            for (PsiClass iface : containingClass.getInterfaces()) {
+                String ifaceDoc = getClassComment(iface);
+                if (!ifaceDoc.isEmpty()) {
+                    String name = iface.getName() != null ? iface.getName() : "";
+                    entries.add("[" + p + "所在接口: " + name + "] " + ifaceDoc);
+                }
+            }
+            // 父类（排除 java.lang.Object）
+            PsiClass superCls = containingClass.getSuperClass();
+            if (superCls != null && !"java.lang.Object".equals(superCls.getQualifiedName())) {
+                String superDoc = getClassComment(superCls);
+                if (!superDoc.isEmpty()) {
+                    String name = superCls.getName() != null ? superCls.getName() : "";
+                    entries.add("[" + p + "所在父类: " + name + "] " + superDoc);
+                }
             }
         }
 
-        // 接口 / 父类方法注释
+        // ── 2. 方法级别注释 ──
+        String selfLabel = p.isEmpty() ? "[自身]" : "[" + p + ": " + shortMethodSig(method) + "]";
+        PsiDocComment doc = method.getDocComment();
+        if (doc != null) {
+            String text = extractDocText(doc);
+            if (!text.isEmpty()) entries.add(selfLabel + " " + text);
+        }
+
         for (PsiMethod superMethod : method.findSuperMethods()) {
             PsiDocComment superDoc = superMethod.getDocComment();
             if (superDoc == null) continue;
             String text = extractDocText(superDoc);
             if (text.isEmpty()) continue;
-
             PsiClass superClass = superMethod.getContainingClass();
             boolean isInterface = superClass != null && superClass.isInterface();
             String kind = isInterface ? "接口" : "父类";
-            String superLabel = levelPrefix.isEmpty()
-                    ? "[" + kind + ": " + shortMethodSig(superMethod) + "]"
-                    : "[" + levelPrefix + kind + ": " + shortMethodSig(superMethod) + "]";
-            entries.add(superLabel + " " + text);
+            entries.add("[" + p + kind + ": " + shortMethodSig(superMethod) + "] " + text);
         }
 
         return entries;
