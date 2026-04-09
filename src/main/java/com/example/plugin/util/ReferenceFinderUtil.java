@@ -12,8 +12,16 @@ import com.intellij.psi.search.searches.ReferencesSearch;
 import com.intellij.psi.javadoc.PsiDocComment;
 import com.intellij.psi.util.PsiTreeUtil;
 
+import com.intellij.openapi.vfs.VirtualFile;
+import com.intellij.psi.search.FilenameIndex;
+import com.intellij.psi.search.PsiSearchHelper;
+import com.intellij.psi.search.UsageSearchContext;
+
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * 核心工具：在所有已打开的 IntelliJ 项目中查找方法引用。
@@ -1754,5 +1762,508 @@ public class ReferenceFinderUtil {
             if (match) return candidate;
         }
         return null;
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // 追溯入口链路：从输入方法向上追踪至最终 API / KafkaListener / Scheduled 入口
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /** 追溯结果容器：动态表头 + 数据行。 */
+    public static class TraceResult {
+        public final String header;
+        public final List<String[]> rows;
+
+        public TraceResult(String header, List<String[]> rows) {
+            this.header = header;
+            this.rows = rows;
+        }
+    }
+
+    /** 一条完整调用链（内部使用）。 */
+    private static class ChainResult {
+        final List<String> nodes;       // 中间节点签名（不含源方法和终端）
+        final String terminalSig;       // 终端方法签名
+        final String terminalModule;    // 终端所属模块
+        final String terminalType;      // RestController / KafkaListener / Scheduled / 无引用 / 深度上限
+        final String endpointPath;      // "POST /path" / topic / cron / "-"
+
+        ChainResult(List<String> nodes, String terminalSig, String terminalModule,
+                    String terminalType, String endpointPath) {
+            this.nodes = nodes;
+            this.terminalSig = terminalSig;
+            this.terminalModule = terminalModule;
+            this.terminalType = terminalType;
+            this.endpointPath = endpointPath;
+        }
+    }
+
+    /** 单服务内最大追溯层数。 */
+    private static final int MAX_INTRA_DEPTH = 10;
+    /** 单个输入方法的最大链路数，防止组合爆炸。 */
+    private static final int MAX_CHAINS_PER_INPUT = 500;
+    /** 单个方法最大展开调用方数量。 */
+    private static final int MAX_CALLERS_PER_METHOD = 50;
+
+    /** properties key 正则：restConfig.restMap.{apiname}.url = ... */
+    private static final Pattern REST_URL_KEY_PATTERN =
+            Pattern.compile("restConfig\\.restMap\\.([^.]+)\\.url\\s*=\\s*(.+)");
+
+    /** 从 URL 中提取路径部分（去掉 http(s)://host(:port) 前缀）。 */
+    private static final Pattern URL_PATH_PATTERN =
+            Pattern.compile("https?://[^/]+(/.*)");
+
+    // ── 终端分类辅助 ──────────────────────────────────────────────────────────
+
+    /**
+     * 检查方法是否有 {@code @KafkaListener} 注解，若有则返回 topics 字符串。
+     *
+     * <p>调用方必须持有 ReadAction。
+     *
+     * @return topics 字符串，无注解时返回 null
+     */
+    private static String extractKafkaTopics(PsiMethod method) {
+        for (PsiAnnotation ann : method.getAnnotations()) {
+            if ("KafkaListener".equals(shortName(ann))) {
+                PsiAnnotationMemberValue val = ann.findAttributeValue("topics");
+                if (val != null) return stripQuotes(val.getText());
+                val = ann.findAttributeValue("value");
+                if (val != null) return stripQuotes(val.getText());
+                return "(topics未指定)";
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 检查方法是否有 {@code @Scheduled} 注解，若有则返回调度表达式。
+     *
+     * <p>调用方必须持有 ReadAction。
+     *
+     * @return 调度表达式字符串，无注解时返回 null
+     */
+    private static String extractScheduledExpression(PsiMethod method) {
+        for (PsiAnnotation ann : method.getAnnotations()) {
+            if ("Scheduled".equals(shortName(ann))) {
+                for (String attr : new String[]{"cron", "fixedRate", "fixedDelay", "fixedRateString", "fixedDelayString"}) {
+                    PsiAnnotationMemberValue val = ann.findAttributeValue(attr);
+                    if (val != null) {
+                        String text = stripQuotes(val.getText());
+                        if (!text.isEmpty()) return attr + "=" + text;
+                    }
+                }
+                return "(表达式未指定)";
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 解析 PsiExpression 为字符串值（支持字符串字面量和常量引用）。
+     *
+     * <p>调用方必须持有 ReadAction。
+     *
+     * @return 解析出的字符串值，无法解析时返回 null
+     */
+    private static String resolveStringValue(PsiExpression expr) {
+        if (expr instanceof PsiLiteralExpression) {
+            Object value = ((PsiLiteralExpression) expr).getValue();
+            return value instanceof String ? (String) value : null;
+        }
+        if (expr instanceof PsiReferenceExpression) {
+            PsiElement resolved = ((PsiReferenceExpression) expr).resolve();
+            if (resolved instanceof PsiField) {
+                PsiField field = (PsiField) resolved;
+                PsiExpression initializer = field.getInitializer();
+                if (initializer instanceof PsiLiteralExpression) {
+                    Object value = ((PsiLiteralExpression) initializer).getValue();
+                    return value instanceof String ? (String) value : null;
+                }
+            }
+        }
+        return null;
+    }
+
+    // ── 跨服务解析 ──────────────────────────────────────────────────────────
+
+    /**
+     * 从 HTTP 接口路径（如 "POST /edm/private/getConfig"）中提取纯路径部分。
+     */
+    private static String extractPathFromEndpointInfo(String endpointInfo) {
+        if (endpointInfo == null || "-".equals(endpointInfo)) return null;
+        // endpointInfo 格式为 "POST /path" 或 "GET /path"
+        int space = endpointInfo.indexOf(' ');
+        return space >= 0 ? endpointInfo.substring(space + 1).trim() : endpointInfo.trim();
+    }
+
+    /**
+     * 当追溯到 RestController 端点时，在所有已打开项目的 .properties 文件中
+     * 查找对应的 restConfig.restMap.*.url 配置，定位调用端的 exchangeInApp 调用点。
+     *
+     * @param endpointPath 端点路径，如 "/private/getConfig"
+     * @param indicator    进度指示器
+     * @return 调用 exchangeInApp 的 PsiMethod 列表
+     */
+    private static List<PsiMethod> findCrossServiceCallers(
+            String endpointPath, ProgressIndicator indicator) {
+        if (endpointPath == null || endpointPath.isEmpty()) return Collections.emptyList();
+
+        List<PsiMethod> allCallers = new ArrayList<>();
+
+        for (Project project : ProjectManager.getInstance().getOpenProjects()) {
+            if (indicator != null && indicator.isCanceled()) break;
+
+            // 扫描项目中的 .properties 文件，查找 URL 配置
+            List<String> matchedApiNames = ReadAction.compute(() -> {
+                List<String> apiNames = new ArrayList<>();
+                Collection<VirtualFile> propFiles = FilenameIndex.getAllFilesByExt(
+                        project, "properties", GlobalSearchScope.projectScope(project));
+                for (VirtualFile vf : propFiles) {
+                    try {
+                        String content = new String(vf.contentsToByteArray(),
+                                vf.getCharset() != null ? vf.getCharset() : StandardCharsets.UTF_8);
+                        for (String line : content.split("\\r?\\n")) {
+                            Matcher m = REST_URL_KEY_PATTERN.matcher(line.trim());
+                            if (!m.matches()) continue;
+                            String apiName = m.group(1);
+                            String urlValue = m.group(2).trim();
+                            // 从 URL 值中提取路径
+                            Matcher pathMatcher = URL_PATH_PATTERN.matcher(urlValue);
+                            String urlPath = pathMatcher.matches()
+                                    ? pathMatcher.group(1)
+                                    : urlValue; // 无 http 前缀时当作纯路径
+                            // 标准化后比较
+                            if (normalizePath(urlPath).equals(normalizePath(endpointPath))) {
+                                apiNames.add(apiName);
+                            }
+                        }
+                    } catch (Exception ignored) {
+                        // 读取失败的文件跳过
+                    }
+                }
+                return apiNames;
+            });
+
+            // 对每个 apiName，查找 exchangeInApp 调用点
+            for (String apiName : matchedApiNames) {
+                if (indicator != null && indicator.isCanceled()) break;
+                allCallers.addAll(findExchangeInAppCallers(apiName, project));
+            }
+        }
+
+        return allCallers;
+    }
+
+    /**
+     * 在指定项目中查找 {@code exchangeInApp("apiName", ...)} 的调用点。
+     *
+     * @param apiName 接口名称
+     * @param project 目标项目
+     * @return 包含该调用的方法列表
+     */
+    private static List<PsiMethod> findExchangeInAppCallers(String apiName, Project project) {
+        List<PsiMethod> callers = new ArrayList<>();
+
+        ReadAction.run(() -> {
+            PsiSearchHelper helper = PsiSearchHelper.getInstance(project);
+            helper.processElementsWithWord(
+                    (element, offsetInElement) -> {
+                        // 向上找到方法调用表达式
+                        PsiMethodCallExpression call = PsiTreeUtil.getParentOfType(
+                                element, PsiMethodCallExpression.class);
+                        if (call == null) return true;
+
+                        // 验证方法名
+                        String methodName = call.getMethodExpression().getReferenceName();
+                        if (!"exchangeInApp".equals(methodName)) return true;
+
+                        // 提取第一个参数，解析为字符串值
+                        PsiExpression[] args = call.getArgumentList().getExpressions();
+                        if (args.length == 0) return true;
+
+                        String resolvedName = resolveStringValue(args[0]);
+                        if (!apiName.equals(resolvedName)) return true;
+
+                        // 匹配！获取包含方法
+                        PsiMethod containingMethod = PsiTreeUtil.getParentOfType(
+                                call, PsiMethod.class);
+                        if (containingMethod != null) {
+                            callers.add(containingMethod);
+                        }
+                        return true;
+                    },
+                    GlobalSearchScope.projectScope(project),
+                    "exchangeInApp",
+                    UsageSearchContext.IN_CODE,
+                    true);
+        });
+
+        return callers;
+    }
+
+    // ── 核心追溯逻辑 ──────────────────────────────────────────────────────────
+
+    /**
+     * 在所有已打开项目中查找 method 的所有直接调用方（仅方法体内调用，忽略 import/字段等）。
+     *
+     * @return 调用方 PsiMethod 列表
+     */
+    private static List<PsiMethod> findAllCallersAcrossProjects(
+            PsiMethod method, ProgressIndicator indicator) {
+        List<PsiMethod> callers = new ArrayList<>();
+
+        String[] methodInfo = ReadAction.compute(() -> {
+            PsiClass cls = method.getContainingClass();
+            if (cls == null) return null;
+            String qn = cls.getQualifiedName();
+            if (qn == null) return null;
+            return new String[]{qn};
+        });
+        if (methodInfo == null) return callers;
+
+        for (Project project : ProjectManager.getInstance().getOpenProjects()) {
+            if (indicator != null && indicator.isCanceled()) break;
+
+            PsiMethod target = ReadAction.compute(() -> {
+                JavaPsiFacade facade = JavaPsiFacade.getInstance(project);
+                PsiClass targetClass = facade.findClass(
+                        methodInfo[0], GlobalSearchScope.allScope(project));
+                return targetClass == null ? null : findMatchingMethod(targetClass, method);
+            });
+            if (target == null) continue;
+
+            ReferencesSearch.search(target, GlobalSearchScope.projectScope(project))
+                    .forEach(ref -> {
+                        if (indicator != null && indicator.isCanceled()) return false;
+                        PsiMethod caller = ReadAction.compute(() ->
+                                PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
+                        if (caller != null) {
+                            callers.add(caller);
+                        }
+                        return callers.size() < MAX_CALLERS_PER_METHOD;
+                    });
+        }
+
+        return callers;
+    }
+
+    /**
+     * 递归向上追溯调用链，直到到达终端入口节点。
+     *
+     * @param method          当前方法
+     * @param chain           已积累的中间节点签名列表
+     * @param serviceHops     已跨越的微服务数
+     * @param maxServiceHops  最大跨服务跳数
+     * @param intraDepth      当前服务内已追溯层数
+     * @param visited         已访问方法签名集合（防环）
+     * @param inputSig        原始输入方法签名
+     * @param inputModule     原始输入方法所属模块
+     * @param results         收集到的完整链路结果
+     * @param indicator       进度指示器
+     */
+    private static void traceUpward(
+            PsiMethod method, List<String> chain,
+            int serviceHops, int maxServiceHops,
+            int intraDepth,
+            Set<String> visited,
+            String inputSig, String inputModule,
+            List<ChainResult> results,
+            ProgressIndicator indicator) {
+
+        if (indicator != null && indicator.isCanceled()) return;
+        if (results.size() >= MAX_CHAINS_PER_INPUT) return;
+
+        String sig = ReadAction.compute(() -> getMethodSignature(method));
+        if (visited.contains(sig)) return;
+        visited.add(sig);
+
+        String moduleName = ReadAction.compute(() -> {
+            Module mod = ModuleUtilCore.findModuleForPsiElement(method);
+            return mod != null ? mod.getName() : "";
+        });
+
+        // ── 检查 KafkaListener / Scheduled 终端（始终为终端，不再向上）──
+        String kafkaTopics = ReadAction.compute(() -> extractKafkaTopics(method));
+        if (kafkaTopics != null) {
+            results.add(new ChainResult(new ArrayList<>(chain), sig, moduleName,
+                    "KafkaListener", kafkaTopics));
+            return;
+        }
+
+        String scheduledExpr = ReadAction.compute(() -> extractScheduledExpression(method));
+        if (scheduledExpr != null) {
+            results.add(new ChainResult(new ArrayList<>(chain), sig, moduleName,
+                    "Scheduled", scheduledExpr));
+            return;
+        }
+
+        // ── 深度上限 ──
+        if (intraDepth >= MAX_INTRA_DEPTH) {
+            results.add(new ChainResult(new ArrayList<>(chain), sig, moduleName,
+                    "深度上限", "-"));
+            return;
+        }
+
+        // ── 查找 Java 调用方 ──
+        List<PsiMethod> callers = findAllCallersAcrossProjects(method, indicator);
+
+        if (callers.isEmpty()) {
+            // 无 Java 调用方 → 检查是否为 RestController 端点
+            String[] endpointInfo = ReadAction.compute(() -> getEndpointInfo(method));
+            if ("是".equals(endpointInfo[0])) {
+                // 是 RestController 端点
+                if (serviceHops < maxServiceHops) {
+                    // 尝试跨服务解析
+                    String path = extractPathFromEndpointInfo(endpointInfo[1]);
+                    List<PsiMethod> crossCallers = findCrossServiceCallers(path, indicator);
+                    if (!crossCallers.isEmpty()) {
+                        // 将当前端点加入链路，继续在另一个服务追溯
+                        List<String> newChain = new ArrayList<>(chain);
+                        newChain.add(sig);
+                        for (PsiMethod crossCaller : crossCallers) {
+                            if (results.size() >= MAX_CHAINS_PER_INPUT) break;
+                            traceUpward(crossCaller, newChain,
+                                    serviceHops + 1, maxServiceHops,
+                                    0, // 重置服务内深度
+                                    new HashSet<>(visited),
+                                    inputSig, inputModule,
+                                    results, indicator);
+                        }
+                        return;
+                    }
+                }
+                // 无跨服务调用方 或 已达跳数上限 → 这就是最终 API 入口
+                results.add(new ChainResult(new ArrayList<>(chain), sig, moduleName,
+                        "RestController", endpointInfo[1]));
+            } else {
+                // 不是 RestController → 无引用终端
+                results.add(new ChainResult(new ArrayList<>(chain), sig, moduleName,
+                        "无引用", "-"));
+            }
+            return;
+        }
+
+        // ── 有 Java 调用方 → 对每个调用方继续向上 ──
+        for (PsiMethod caller : callers) {
+            if (results.size() >= MAX_CHAINS_PER_INPUT) break;
+            List<String> newChain = new ArrayList<>(chain);
+            newChain.add(sig);
+            traceUpward(caller, newChain,
+                    serviceHops, maxServiceHops,
+                    intraDepth + 1,
+                    new HashSet<>(visited),
+                    inputSig, inputModule,
+                    results, indicator);
+        }
+    }
+
+    /**
+     * 从输入的方法签名列表出发，向上追溯调用链直至终端入口节点
+     * （RestController / KafkaListener / Scheduled / 无引用），
+     * 支持跨微服务追踪（通过 .properties 文件的 restConfig.restMap.*.url 配置）。
+     *
+     * @param signatures     方法签名列表
+     * @param maxServiceHops 跨服务最大跳数（建议 3）
+     * @param indicator      进度指示器
+     * @return 追溯结果（动态表头 + 数据行）
+     */
+    public static TraceResult traceUpwardToEndpoints(
+            List<String> signatures, int maxServiceHops, ProgressIndicator indicator) {
+
+        // 收集所有输入方法的链路结果：inputSig → (inputModule, List<ChainResult>)
+        Map<String, String> inputModules = new LinkedHashMap<>();
+        Map<String, List<ChainResult>> allChains = new LinkedHashMap<>();
+
+        for (String rawSig : signatures) {
+            String signature = rawSig.trim();
+            if (signature.isEmpty()) continue;
+            if (indicator != null) {
+                indicator.setText("追溯: " + signature);
+                if (indicator.isCanceled()) break;
+            }
+
+            // 在所有已打开项目中查找该方法
+            List<PsiMethod> sourceMethods = new ArrayList<>();
+            String sourceModule = "";
+            for (Project project : ProjectManager.getInstance().getOpenProjects()) {
+                List<PsiMethod> found = ReadAction.compute(() ->
+                        findMethodsBySignature(signature, project));
+                if (!found.isEmpty()) {
+                    sourceMethods.addAll(found);
+                    final PsiMethod firstMethod = found.get(0);
+                    sourceModule = ReadAction.compute(() -> {
+                        Module mod = ModuleUtilCore.findModuleForPsiElement(firstMethod);
+                        return mod != null ? mod.getName() : "";
+                    });
+                    break;
+                }
+            }
+
+            inputModules.put(signature, sourceModule);
+
+            if (sourceMethods.isEmpty()) {
+                // 未找到方法
+                List<ChainResult> empty = new ArrayList<>();
+                empty.add(new ChainResult(Collections.emptyList(),
+                        "(未找到该方法)", "", "未找到", "-"));
+                allChains.put(signature, empty);
+                continue;
+            }
+
+            List<ChainResult> chains = new ArrayList<>();
+            for (PsiMethod sourceMethod : sourceMethods) {
+                if (indicator != null && indicator.isCanceled()) break;
+                traceUpward(sourceMethod, new ArrayList<>(),
+                        0, maxServiceHops, 0,
+                        new HashSet<>(),
+                        signature, sourceModule,
+                        chains, indicator);
+            }
+
+            if (chains.isEmpty()) {
+                chains.add(new ChainResult(Collections.emptyList(),
+                        signature, sourceModule, "无引用", "-"));
+            }
+
+            allChains.put(signature, chains);
+        }
+
+        // ── 计算最大节点列数 ──
+        int maxNodeCount = 0;
+        for (List<ChainResult> chains : allChains.values()) {
+            for (ChainResult cr : chains) {
+                maxNodeCount = Math.max(maxNodeCount, cr.nodes.size());
+            }
+        }
+
+        // ── 构造动态表头 ──
+        StringBuilder header = new StringBuilder("源方法,源方法所属模块,最终目标,所属模块,入口类型,接口路径");
+        for (int i = 1; i <= maxNodeCount; i++) {
+            header.append(",节点").append(i);
+        }
+        header.append("\n");
+
+        // ── 构造数据行 ──
+        List<String[]> rows = new ArrayList<>();
+        int totalCols = 6 + maxNodeCount;
+
+        for (Map.Entry<String, List<ChainResult>> entry : allChains.entrySet()) {
+            String inputSig = entry.getKey();
+            String inputModule = inputModules.get(inputSig);
+            for (ChainResult cr : entry.getValue()) {
+                String[] row = new String[totalCols];
+                row[0] = inputSig;
+                row[1] = inputModule != null ? inputModule : "";
+                row[2] = cr.terminalSig;
+                row[3] = cr.terminalModule;
+                row[4] = cr.terminalType;
+                row[5] = cr.endpointPath;
+                for (int i = 0; i < maxNodeCount; i++) {
+                    row[6 + i] = i < cr.nodes.size() ? cr.nodes.get(i) : "";
+                }
+                rows.add(row);
+            }
+        }
+
+        return new TraceResult(header.toString(), rows);
     }
 }

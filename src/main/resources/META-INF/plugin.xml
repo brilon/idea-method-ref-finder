@@ -1,7 +1,7 @@
 <idea-plugin>
     <id>com.example.method-ref-finder</id>
     <name>Cross-Project Method Reference Finder</name>
-    <version>2.0.3</version>
+    <version>2.1.0</version>
     <vendor email="dev@example.com">Example</vendor>
 
     <description><![CDATA[
@@ -145,6 +145,13 @@
                 class="com.example.plugin.action.InputMethodRefsWithCommentsPreviewAction"
                 text="输入方法签名查引用注释 (预览CSV)"
                 description="输入多行方法签名，批量查找跨项目引用，输出源方法注释（含接口/父类来源）和引用链注释（最多 3 层，每层含接口/父类来源），结果在 Tool Window 中预览">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+        </action>
+
+        <action id="com.example.plugin.TraceEndpointChainPreview"
+                class="com.example.plugin.action.TraceEndpointChainPreviewAction"
+                text="追溯入口链路 (预览CSV)"
+                description="输入方法签名，向上追溯调用链至 RestController/KafkaListener/Scheduled 入口，支持跨微服务追踪（通过 restService.properties + exchangeInApp），结果在 Tool Window 中预览">
             <add-to-group group-id="EditorPopupMenu" anchor="last"/>
         </action>
     </actions>
