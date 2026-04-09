@@ -2028,6 +2028,13 @@ public class ReferenceFinderUtil {
     /**
      * 在所有已打开项目中查找 method 的所有直接调用方（仅方法体内调用，忽略 import/字段等）。
      *
+     * <p>三层回退策略：
+     * <ol>
+     *   <li>直接搜索方法自身的引用</li>
+     *   <li>搜索<b>项目级</b>父类/接口方法的引用（排除 JDK / Spring 等框架接口）</li>
+     *   <li>若方法实现了框架接口（Callable / Runnable 等），搜索所在类的引用（找到 submit/execute 调用方）</li>
+     * </ol>
+     *
      * @return 调用方 PsiMethod 列表
      */
     private static List<PsiMethod> findAllCallersAcrossProjects(
@@ -2043,6 +2050,7 @@ public class ReferenceFinderUtil {
         });
         if (methodInfo == null) return callers;
 
+        // ── 第 1 层：直接搜索方法自身的引用 ──
         for (Project project : ProjectManager.getInstance().getOpenProjects()) {
             if (indicator != null && indicator.isCanceled()) break;
 
@@ -2056,40 +2064,111 @@ public class ReferenceFinderUtil {
 
             searchMethodCallers(target, project, callers, indicator);
         }
+        if (!callers.isEmpty()) return callers;
 
-        // 若直接搜索无结果，尝试搜索父类/接口中的同名方法的引用
-        if (callers.isEmpty()) {
-            PsiMethod[] superMethods = ReadAction.compute(method::findSuperMethods);
-            for (PsiMethod superMethod : superMethods) {
+        // ── 第 2 层：搜索项目级父类/接口方法的引用（跳过框架/JDK 接口）──
+        PsiMethod[] superMethods = ReadAction.compute(method::findSuperMethods);
+        boolean hasFrameworkSuper = false;
+
+        for (PsiMethod superMethod : superMethods) {
+            if (indicator != null && indicator.isCanceled()) break;
+
+            // 判断父方法所在类是否为项目源码（非框架/库）
+            if (!isProjectClass(superMethod)) {
+                hasFrameworkSuper = true;
+                continue; // 跳过框架接口方法
+            }
+
+            if (!callers.isEmpty()) break;
+
+            String[] superInfo = ReadAction.compute(() -> {
+                PsiClass cls = superMethod.getContainingClass();
+                if (cls == null) return null;
+                String qn = cls.getQualifiedName();
+                if (qn == null) return null;
+                return new String[]{qn};
+            });
+            if (superInfo == null) continue;
+
+            for (Project project : ProjectManager.getInstance().getOpenProjects()) {
                 if (indicator != null && indicator.isCanceled()) break;
-                if (!callers.isEmpty()) break;
 
-                String[] superInfo = ReadAction.compute(() -> {
-                    PsiClass cls = superMethod.getContainingClass();
-                    if (cls == null) return null;
-                    String qn = cls.getQualifiedName();
-                    if (qn == null) return null;
-                    return new String[]{qn};
+                PsiMethod target = ReadAction.compute(() -> {
+                    JavaPsiFacade facade = JavaPsiFacade.getInstance(project);
+                    PsiClass targetClass = facade.findClass(
+                            superInfo[0], GlobalSearchScope.allScope(project));
+                    return targetClass == null ? null : findMatchingMethod(targetClass, superMethod);
                 });
-                if (superInfo == null) continue;
+                if (target == null) continue;
 
-                for (Project project : ProjectManager.getInstance().getOpenProjects()) {
-                    if (indicator != null && indicator.isCanceled()) break;
+                searchMethodCallers(target, project, callers, indicator);
+            }
+        }
+        if (!callers.isEmpty()) return callers;
 
-                    PsiMethod target = ReadAction.compute(() -> {
-                        JavaPsiFacade facade = JavaPsiFacade.getInstance(project);
-                        PsiClass targetClass = facade.findClass(
-                                superInfo[0], GlobalSearchScope.allScope(project));
-                        return targetClass == null ? null : findMatchingMethod(targetClass, superMethod);
-                    });
-                    if (target == null) continue;
-
-                    searchMethodCallers(target, project, callers, indicator);
-                }
+        // ── 第 3 层：实现了框架接口（Callable/Runnable 等）→ 搜索所在类的引用 ──
+        // 场景：MyTask implements Callable → executor.submit(new MyTask()) → 找到 submit 所在方法
+        if (hasFrameworkSuper) {
+            PsiClass containingClass = ReadAction.compute(method::getContainingClass);
+            if (containingClass != null && !(containingClass instanceof PsiAnonymousClass)) {
+                searchClassInstantiationCallers(containingClass, callers, indicator);
             }
         }
 
         return callers;
+    }
+
+    /**
+     * 判断方法所在类是否为项目源码（非框架/JDK/第三方库）。
+     *
+     * <p>在所有已打开项目的 {@code projectScope}（仅源码）中查找该类，
+     * 找到则为项目类，仅在 {@code allScope}（含库）中找到则为框架类。
+     */
+    private static boolean isProjectClass(PsiMethod method) {
+        String qn = ReadAction.compute(() -> {
+            PsiClass cls = method.getContainingClass();
+            return cls != null ? cls.getQualifiedName() : null;
+        });
+        if (qn == null) return false;
+
+        for (Project project : ProjectManager.getInstance().getOpenProjects()) {
+            PsiClass found = ReadAction.compute(() ->
+                    JavaPsiFacade.getInstance(project)
+                            .findClass(qn, GlobalSearchScope.projectScope(project)));
+            if (found != null) return true;
+        }
+        return false;
+    }
+
+    /**
+     * 搜索类的引用（构造 / new / 类型引用），找到实例化该类的外层方法作为调用方。
+     *
+     * <p>用于处理 Callable/Runnable 等任务类：{@code executor.submit(new MyTask())} 场景。
+     */
+    private static void searchClassInstantiationCallers(
+            PsiClass taskClass, List<PsiMethod> callers, ProgressIndicator indicator) {
+        String qn = ReadAction.compute(taskClass::getQualifiedName);
+        if (qn == null) return;
+
+        for (Project project : ProjectManager.getInstance().getOpenProjects()) {
+            if (indicator != null && indicator.isCanceled()) break;
+
+            PsiClass target = ReadAction.compute(() ->
+                    JavaPsiFacade.getInstance(project)
+                            .findClass(qn, GlobalSearchScope.allScope(project)));
+            if (target == null) continue;
+
+            ReferencesSearch.search(target, GlobalSearchScope.projectScope(project))
+                    .forEach(ref -> {
+                        if (indicator != null && indicator.isCanceled()) return false;
+                        PsiMethod caller = ReadAction.compute(() ->
+                                resolveOuterCaller(ref.getElement()));
+                        if (caller != null) {
+                            callers.add(caller);
+                        }
+                        return callers.size() < MAX_CALLERS_PER_METHOD;
+                    });
+        }
     }
 
     /** 在指定项目中搜索方法的调用方，结果追加到 callers 列表。 */
