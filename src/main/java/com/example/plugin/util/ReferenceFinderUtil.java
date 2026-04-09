@@ -1816,7 +1816,7 @@ public class ReferenceFinderUtil {
     }
 
     /** 单服务内最大追溯层数。 */
-    private static final int MAX_INTRA_DEPTH = 10;
+    private static final int MAX_INTRA_DEPTH = 20;
     /** 单个输入方法的最大链路数，防止组合爆炸。 */
     private static final int MAX_CHAINS_PER_INPUT = 500;
     /** 单个方法最大展开调用方数量。 */
@@ -1944,13 +1944,18 @@ public class ReferenceFinderUtil {
                             if (!m.matches()) continue;
                             String apiName = m.group(1);
                             String urlValue = m.group(2).trim();
-                            // 从 URL 值中提取路径
+                            // 从 URL 值中提取路径（去掉 http://host 前缀和 ?query 后缀）
                             Matcher pathMatcher = URL_PATH_PATTERN.matcher(urlValue);
                             String urlPath = pathMatcher.matches()
                                     ? pathMatcher.group(1)
                                     : urlValue; // 无 http 前缀时当作纯路径
-                            // 标准化后比较
-                            if (normalizePath(urlPath).equals(normalizePath(endpointPath))) {
+                            // 去掉查询参数
+                            int qIdx = urlPath.indexOf('?');
+                            if (qIdx >= 0) urlPath = urlPath.substring(0, qIdx);
+                            // 标准化后做尾部匹配
+                            String normalizedUrl = normalizePath(urlPath);
+                            String normalizedEndpoint = normalizePath(endpointPath);
+                            if (normalizedUrl.endsWith(normalizedEndpoint)) {
                                 apiNames.add(apiName);
                             }
                         }
@@ -2094,12 +2099,34 @@ public class ReferenceFinderUtil {
                 .forEach(ref -> {
                     if (indicator != null && indicator.isCanceled()) return false;
                     PsiMethod caller = ReadAction.compute(() ->
-                            PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
+                            resolveOuterCaller(ref.getElement()));
                     if (caller != null) {
                         callers.add(caller);
                     }
                     return callers.size() < MAX_CALLERS_PER_METHOD;
                 });
+    }
+
+    /**
+     * 从引用元素找到真正的外部调用方法。
+     *
+     * <p>如果引用位于匿名类（如 {@code new Callable<T>() { call() { ... } }}）内部的方法中，
+     * 则向上穿透匿名类，返回真正包含该匿名类的外部方法。
+     *
+     * <p>调用方必须持有 ReadAction。
+     */
+    private static PsiMethod resolveOuterCaller(PsiElement element) {
+        PsiMethod caller = PsiTreeUtil.getParentOfType(element, PsiMethod.class);
+        // 向上穿透匿名类：如果 caller 所在类是匿名类，继续向外找
+        while (caller != null) {
+            PsiClass containingClass = caller.getContainingClass();
+            if (containingClass instanceof PsiAnonymousClass) {
+                caller = PsiTreeUtil.getParentOfType(containingClass, PsiMethod.class);
+            } else {
+                break;
+            }
+        }
+        return caller;
     }
 
     /**
