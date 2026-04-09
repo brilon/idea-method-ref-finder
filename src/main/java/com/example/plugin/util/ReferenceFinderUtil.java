@@ -1729,7 +1729,8 @@ public class ReferenceFinderUtil {
             PsiParameter[] params = method.getParameterList().getParameters();
             if (params.length != paramTypes.length) continue;
             for (int i = 0; i < params.length; i++) {
-                if (!params[i].getType().getCanonicalText().equals(paramTypes[i].trim())) continue outer;
+                if (!typeMatches(params[i].getType().getCanonicalText(), paramTypes[i].trim()))
+                    continue outer;
             }
             return Collections.singletonList(method);
         }
@@ -1754,7 +1755,7 @@ public class ReferenceFinderUtil {
             for (int i = 0; i < sourceParams.length; i++) {
                 String sourceType    = sourceParams[i].getType().getCanonicalText();
                 String candidateType = candidateParams[i].getType().getCanonicalText();
-                if (!sourceType.equals(candidateType)) {
+                if (!typeMatches(sourceType, candidateType)) {
                     match = false;
                     break;
                 }
@@ -1762,6 +1763,23 @@ public class ReferenceFinderUtil {
             if (match) return candidate;
         }
         return null;
+    }
+
+    /**
+     * 比较两个类型文本是否匹配，支持泛型擦除匹配。
+     *
+     * <p>当精确匹配失败时，擦除双方的泛型参数（去掉 {@code <...>} 部分）后再比较。
+     * 例如 {@code "java.util.List"} 可匹配 {@code "java.util.List<java.lang.String>"}。
+     */
+    private static boolean typeMatches(String type1, String type2) {
+        if (type1.equals(type2)) return true;
+        return eraseGenerics(type1).equals(eraseGenerics(type2));
+    }
+
+    /** 擦除类型文本中的泛型参数：{@code "java.util.Map<K, V>"} → {@code "java.util.Map"}。 */
+    private static String eraseGenerics(String type) {
+        int lt = type.indexOf('<');
+        return lt >= 0 ? type.substring(0, lt) : type;
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -1804,9 +1822,9 @@ public class ReferenceFinderUtil {
     /** 单个方法最大展开调用方数量。 */
     private static final int MAX_CALLERS_PER_METHOD = 50;
 
-    /** properties key 正则：restConfig.restMap.{apiname}.url = ... */
+    /** properties key 正则：restConfig.restMap.{apiname}.requestUrl = ... */
     private static final Pattern REST_URL_KEY_PATTERN =
-            Pattern.compile("restConfig\\.restMap\\.([^.]+)\\.url\\s*=\\s*(.+)");
+            Pattern.compile("restConfig\\.restMap\\.([^.]+)\\.requestUrl\\s*=\\s*(.+)");
 
     /** 从 URL 中提取路径部分（去掉 http(s)://host(:port) 前缀）。 */
     private static final Pattern URL_PATH_PATTERN =
@@ -2031,19 +2049,57 @@ public class ReferenceFinderUtil {
             });
             if (target == null) continue;
 
-            ReferencesSearch.search(target, GlobalSearchScope.projectScope(project))
-                    .forEach(ref -> {
-                        if (indicator != null && indicator.isCanceled()) return false;
-                        PsiMethod caller = ReadAction.compute(() ->
-                                PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
-                        if (caller != null) {
-                            callers.add(caller);
-                        }
-                        return callers.size() < MAX_CALLERS_PER_METHOD;
+            searchMethodCallers(target, project, callers, indicator);
+        }
+
+        // 若直接搜索无结果，尝试搜索父类/接口中的同名方法的引用
+        if (callers.isEmpty()) {
+            PsiMethod[] superMethods = ReadAction.compute(method::findSuperMethods);
+            for (PsiMethod superMethod : superMethods) {
+                if (indicator != null && indicator.isCanceled()) break;
+                if (!callers.isEmpty()) break;
+
+                String[] superInfo = ReadAction.compute(() -> {
+                    PsiClass cls = superMethod.getContainingClass();
+                    if (cls == null) return null;
+                    String qn = cls.getQualifiedName();
+                    if (qn == null) return null;
+                    return new String[]{qn};
+                });
+                if (superInfo == null) continue;
+
+                for (Project project : ProjectManager.getInstance().getOpenProjects()) {
+                    if (indicator != null && indicator.isCanceled()) break;
+
+                    PsiMethod target = ReadAction.compute(() -> {
+                        JavaPsiFacade facade = JavaPsiFacade.getInstance(project);
+                        PsiClass targetClass = facade.findClass(
+                                superInfo[0], GlobalSearchScope.allScope(project));
+                        return targetClass == null ? null : findMatchingMethod(targetClass, superMethod);
                     });
+                    if (target == null) continue;
+
+                    searchMethodCallers(target, project, callers, indicator);
+                }
+            }
         }
 
         return callers;
+    }
+
+    /** 在指定项目中搜索方法的调用方，结果追加到 callers 列表。 */
+    private static void searchMethodCallers(PsiMethod target, Project project,
+                                            List<PsiMethod> callers, ProgressIndicator indicator) {
+        ReferencesSearch.search(target, GlobalSearchScope.projectScope(project))
+                .forEach(ref -> {
+                    if (indicator != null && indicator.isCanceled()) return false;
+                    PsiMethod caller = ReadAction.compute(() ->
+                            PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
+                    if (caller != null) {
+                        callers.add(caller);
+                    }
+                    return callers.size() < MAX_CALLERS_PER_METHOD;
+                });
     }
 
     /**
