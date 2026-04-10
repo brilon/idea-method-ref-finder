@@ -11,6 +11,6 @@
 <plugins>
   <plugin
     id="com.example.method-ref-finder"
-    url="https://github.com/brilon/idea-method-ref-finder/releases/download/v2.1.3/idea-method-ref-finder-2.1.3.zip"
-    version="2.1.3"/>
+    url="https://github.com/brilon/idea-method-ref-finder/releases/download/v2.1.4/idea-method-ref-finder-2.1.4.zip"
+    version="2.1.4"/>
 </plugins>
