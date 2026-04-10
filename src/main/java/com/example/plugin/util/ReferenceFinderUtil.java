@@ -1799,19 +1799,35 @@ public class ReferenceFinderUtil {
 
     /** 一条完整调用链（内部使用）。 */
     private static class ChainResult {
-        final List<String> nodes;       // 中间节点签名（不含源方法和终端）
-        final String terminalSig;       // 终端方法签名
-        final String terminalModule;    // 终端所属模块
-        final String terminalType;      // RestController / KafkaListener / Scheduled / 无引用 / 深度上限
-        final String endpointPath;      // "POST /path" / topic / cron / "-"
+        final List<String> nodes;           // 中间节点签名（不含源方法和终端）
+        final String terminalSig;           // 终端方法签名
+        final String terminalModule;        // 终端所属模块
+        final String terminalType;          // RestController / KafkaListener / Scheduled / 无引用 / 深度上限
+        final String endpointPath;          // "POST /path" / topic / cron / "-"
+        final String sourceModuleEndpoint;  // 源方法所属模块的 RestController 接口路径
+        final String crossServiceApiName;   // 跨服务调用使用的 API 名称
 
         ChainResult(List<String> nodes, String terminalSig, String terminalModule,
-                    String terminalType, String endpointPath) {
+                    String terminalType, String endpointPath,
+                    String sourceModuleEndpoint, String crossServiceApiName) {
             this.nodes = nodes;
             this.terminalSig = terminalSig;
             this.terminalModule = terminalModule;
             this.terminalType = terminalType;
             this.endpointPath = endpointPath;
+            this.sourceModuleEndpoint = sourceModuleEndpoint != null ? sourceModuleEndpoint : "-";
+            this.crossServiceApiName = crossServiceApiName != null ? crossServiceApiName : "-";
+        }
+    }
+
+    /** 跨服务调用方信息：PsiMethod + 匹配的 API 名称。 */
+    private static class CrossServiceCaller {
+        final PsiMethod method;
+        final String apiName;
+
+        CrossServiceCaller(PsiMethod method, String apiName) {
+            this.method = method;
+            this.apiName = apiName;
         }
     }
 
@@ -1921,11 +1937,11 @@ public class ReferenceFinderUtil {
      * @param indicator    进度指示器
      * @return 调用 exchangeInApp 的 PsiMethod 列表
      */
-    private static List<PsiMethod> findCrossServiceCallers(
+    private static List<CrossServiceCaller> findCrossServiceCallers(
             String endpointPath, ProgressIndicator indicator) {
         if (endpointPath == null || endpointPath.isEmpty()) return Collections.emptyList();
 
-        List<PsiMethod> allCallers = new ArrayList<>();
+        List<CrossServiceCaller> allCallers = new ArrayList<>();
 
         for (Project project : ProjectManager.getInstance().getOpenProjects()) {
             if (indicator != null && indicator.isCanceled()) break;
@@ -1969,7 +1985,9 @@ public class ReferenceFinderUtil {
             // 对每个 apiName，查找 exchangeInApp 调用点
             for (String apiName : matchedApiNames) {
                 if (indicator != null && indicator.isCanceled()) break;
-                allCallers.addAll(findExchangeInAppCallers(apiName, project));
+                for (PsiMethod caller : findExchangeInAppCallers(apiName, project)) {
+                    allCallers.add(new CrossServiceCaller(caller, apiName));
+                }
             }
         }
 
@@ -2228,6 +2246,7 @@ public class ReferenceFinderUtil {
             int intraDepth,
             Set<String> visited,
             String inputSig, String inputModule,
+            String sourceModuleEndpoint, String crossServiceApiName,
             List<ChainResult> results,
             ProgressIndicator indicator) {
 
@@ -2247,21 +2266,21 @@ public class ReferenceFinderUtil {
         String kafkaTopics = ReadAction.compute(() -> extractKafkaTopics(method));
         if (kafkaTopics != null) {
             results.add(new ChainResult(new ArrayList<>(chain), sig, moduleName,
-                    "KafkaListener", kafkaTopics));
+                    "KafkaListener", kafkaTopics, sourceModuleEndpoint, crossServiceApiName));
             return;
         }
 
         String scheduledExpr = ReadAction.compute(() -> extractScheduledExpression(method));
         if (scheduledExpr != null) {
             results.add(new ChainResult(new ArrayList<>(chain), sig, moduleName,
-                    "Scheduled", scheduledExpr));
+                    "Scheduled", scheduledExpr, sourceModuleEndpoint, crossServiceApiName));
             return;
         }
 
         // ── 深度上限 ──
         if (intraDepth >= MAX_INTRA_DEPTH) {
             results.add(new ChainResult(new ArrayList<>(chain), sig, moduleName,
-                    "深度上限", "-"));
+                    "深度上限", "-", sourceModuleEndpoint, crossServiceApiName));
             return;
         }
 
@@ -2276,18 +2295,24 @@ public class ReferenceFinderUtil {
                 if (serviceHops < maxServiceHops) {
                     // 尝试跨服务解析
                     String path = extractPathFromEndpointInfo(endpointInfo[1]);
-                    List<PsiMethod> crossCallers = findCrossServiceCallers(path, indicator);
+                    List<CrossServiceCaller> crossCallers = findCrossServiceCallers(path, indicator);
                     if (!crossCallers.isEmpty()) {
+                        // 记录首次跨服务边界信息（后续跳数不覆盖）
+                        String smEndpoint = sourceModuleEndpoint != null
+                                ? sourceModuleEndpoint : endpointInfo[1];
                         // 将当前端点加入链路，继续在另一个服务追溯
                         List<String> newChain = new ArrayList<>(chain);
                         newChain.add(sig);
-                        for (PsiMethod crossCaller : crossCallers) {
+                        for (CrossServiceCaller cc : crossCallers) {
                             if (results.size() >= MAX_CHAINS_PER_INPUT) break;
-                            traceUpward(crossCaller, newChain,
+                            String apiName = crossServiceApiName != null
+                                    ? crossServiceApiName : cc.apiName;
+                            traceUpward(cc.method, newChain,
                                     serviceHops + 1, maxServiceHops,
                                     0, // 重置服务内深度
                                     new HashSet<>(visited),
                                     inputSig, inputModule,
+                                    smEndpoint, apiName,
                                     results, indicator);
                         }
                         return;
@@ -2295,11 +2320,11 @@ public class ReferenceFinderUtil {
                 }
                 // 无跨服务调用方 或 已达跳数上限 → 这就是最终 API 入口
                 results.add(new ChainResult(new ArrayList<>(chain), sig, moduleName,
-                        "RestController", endpointInfo[1]));
+                        "RestController", endpointInfo[1], sourceModuleEndpoint, crossServiceApiName));
             } else {
                 // 不是 RestController → 无引用终端
                 results.add(new ChainResult(new ArrayList<>(chain), sig, moduleName,
-                        "无引用", "-"));
+                        "无引用", "-", sourceModuleEndpoint, crossServiceApiName));
             }
             return;
         }
@@ -2314,6 +2339,7 @@ public class ReferenceFinderUtil {
                     intraDepth + 1,
                     new HashSet<>(visited),
                     inputSig, inputModule,
+                    sourceModuleEndpoint, crossServiceApiName,
                     results, indicator);
         }
     }
@@ -2366,7 +2392,7 @@ public class ReferenceFinderUtil {
                 // 未找到方法
                 List<ChainResult> empty = new ArrayList<>();
                 empty.add(new ChainResult(Collections.emptyList(),
-                        "(未找到该方法)", "", "未找到", "-"));
+                        "(未找到该方法)", "", "未找到", "-", null, null));
                 allChains.put(signature, empty);
                 continue;
             }
@@ -2378,12 +2404,13 @@ public class ReferenceFinderUtil {
                         0, maxServiceHops, 0,
                         new HashSet<>(),
                         signature, sourceModule,
+                        null, null,
                         chains, indicator);
             }
 
             if (chains.isEmpty()) {
                 chains.add(new ChainResult(Collections.emptyList(),
-                        signature, sourceModule, "无引用", "-"));
+                        signature, sourceModule, "无引用", "-", null, null));
             }
 
             allChains.put(signature, chains);
@@ -2398,7 +2425,8 @@ public class ReferenceFinderUtil {
         }
 
         // ── 构造动态表头 ──
-        StringBuilder header = new StringBuilder("源方法,源方法所属模块,最终目标,所属模块,入口类型,接口路径");
+        StringBuilder header = new StringBuilder(
+                "源方法,源方法所属模块,源模块接口路径,API名称,最终目标,所属模块,入口类型,接口路径");
         for (int i = 1; i <= maxNodeCount; i++) {
             header.append(",节点").append(i);
         }
@@ -2406,7 +2434,8 @@ public class ReferenceFinderUtil {
 
         // ── 构造数据行 ──
         List<String[]> rows = new ArrayList<>();
-        int totalCols = 6 + maxNodeCount;
+        int fixedCols = 8;
+        int totalCols = fixedCols + maxNodeCount;
 
         for (Map.Entry<String, List<ChainResult>> entry : allChains.entrySet()) {
             String inputSig = entry.getKey();
@@ -2415,12 +2444,14 @@ public class ReferenceFinderUtil {
                 String[] row = new String[totalCols];
                 row[0] = inputSig;
                 row[1] = inputModule != null ? inputModule : "";
-                row[2] = cr.terminalSig;
-                row[3] = cr.terminalModule;
-                row[4] = cr.terminalType;
-                row[5] = cr.endpointPath;
+                row[2] = cr.sourceModuleEndpoint;
+                row[3] = cr.crossServiceApiName;
+                row[4] = cr.terminalSig;
+                row[5] = cr.terminalModule;
+                row[6] = cr.terminalType;
+                row[7] = cr.endpointPath;
                 for (int i = 0; i < maxNodeCount; i++) {
-                    row[6 + i] = i < cr.nodes.size() ? cr.nodes.get(i) : "";
+                    row[fixedCols + i] = i < cr.nodes.size() ? cr.nodes.get(i) : "";
                 }
                 rows.add(row);
             }
