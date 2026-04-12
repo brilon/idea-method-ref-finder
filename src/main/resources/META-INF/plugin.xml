@@ -154,5 +154,13 @@
                 description="输入方法签名，向上追溯调用链至 RestController/KafkaListener/Scheduled 入口，支持跨微服务追踪（通过 restService.properties + exchangeInApp），结果在 Tool Window 中预览">
             <add-to-group group-id="EditorPopupMenu" anchor="last"/>
         </action>
+
+        <action id="com.example.plugin.TraceEndpointChainCsv"
+                class="com.example.plugin.action.TraceEndpointChainCsvAction"
+                text="追溯入口链路 (导出CSV)"
+                description="输入方法签名，向上追溯调用链至 RestController/KafkaListener/Scheduled 入口，边追溯边流式写入 CSV 文件（GBK 编码，保存至用户主目录）">
+            <add-to-group group-id="EditorPopupMenu" anchor="after"
+                          relative-to-action="com.example.plugin.TraceEndpointChainPreview"/>
+        </action>
     </actions>
 </idea-plugin>

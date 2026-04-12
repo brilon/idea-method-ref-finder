@@ -8,6 +8,7 @@ import com.intellij.openapi.actionSystem.AnAction;
 import com.intellij.openapi.actionSystem.AnActionEvent;
 import com.intellij.openapi.progress.ProgressIndicator;
 import com.intellij.openapi.progress.ProgressManager;
+import com.intellij.openapi.progress.Task;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.ui.DialogWrapper;
 import com.intellij.openapi.ui.Messages;
@@ -24,7 +25,7 @@ import java.util.stream.Collectors;
  * 编辑器右键菜单：输入多行方法签名，向上追溯调用链至终端入口节点
  * （RestController / KafkaListener / Scheduled / 无引用），
  * 支持跨微服务追踪（通过 restService.properties 配置 + exchangeInApp 调用），
- * 结果在 Tool Window 中以 CSV 表格预览。
+ * 结果在 Tool Window 中以 CSV 表格预览。后台执行，取消时弹出确认对话框。
  *
  * <p>输入格式（每行一个）：{@code com.example.ClassName#methodName(param1Type, param2Type)}
  *
@@ -68,32 +69,47 @@ public class TraceEndpointChainPreviewAction extends AnAction {
             return;
         }
 
-        ReferenceFinderUtil.TraceResult[] holder = new ReferenceFinderUtil.TraceResult[1];
+        ReferenceFinderUtil.TraceResult[] holder = {null};
 
-        boolean ok = ProgressManager.getInstance().runProcessWithProgressSynchronously(() -> {
-            ProgressIndicator indicator = ProgressManager.getInstance().getProgressIndicator();
-            holder[0] = ReferenceFinderUtil.traceUpwardToEndpoints(
-                    signatures, MAX_SERVICE_HOPS, indicator);
-        }, "追溯入口链路（共 " + signatures.size() + " 个方法）", true, project);
+        new Task.Backgroundable(project,
+                "追溯入口链路（共 " + signatures.size() + " 个方法）", true) {
 
-        if (!ok || holder[0] == null) {
-            int count = holder[0] != null ? holder[0].rows.size() : 0;
-            Messages.showInfoMessage(project,
-                    "已取消，已收集 " + count + " 条链路。", "已取消");
-            if (holder[0] == null || holder[0].rows.isEmpty()) return;
-        }
+            private volatile boolean wasCancelled = false;
 
-        String csv = CsvExporter.buildCsvString(holder[0].rows, holder[0].header);
-        CsvPreviewUtil.show(project, csv,
-                "入口链路追溯 (" + holder[0].rows.size() + " 条)");
+            @Override
+            public void run(@NotNull ProgressIndicator outerIndicator) {
+                ConfirmCancelIndicator myIndicator = new ConfirmCancelIndicator(outerIndicator);
+                ProgressManager.getInstance().runProcess(() ->
+                        holder[0] = ReferenceFinderUtil.traceUpwardToEndpoints(
+                                signatures, MAX_SERVICE_HOPS, myIndicator),
+                        myIndicator);
+                wasCancelled = myIndicator.isConfirmedCancelled();
+            }
+
+            @Override
+            public void onFinished() {
+                ReferenceFinderUtil.TraceResult result = holder[0];
+                if (result == null || result.rows.isEmpty()) {
+                    Messages.showInfoMessage(project, "已取消或无结果。", "提示");
+                    return;
+                }
+                if (wasCancelled) {
+                    Messages.showInfoMessage(project,
+                            "已取消，已收集 " + result.rows.size() + " 条链路。", "已取消");
+                }
+                String csv = CsvExporter.buildCsvString(result.rows, result.header);
+                CsvPreviewUtil.show(project, csv,
+                        "入口链路追溯 (" + result.rows.size() + " 条)");
+            }
+        }.queue();
     }
 
     /** 多行方法签名输入对话框。 */
-    private static class InputDialog extends DialogWrapper {
+    static class InputDialog extends DialogWrapper {
 
         private JTextArea textArea;
 
-        protected InputDialog(@NotNull Project project) {
+        InputDialog(@NotNull Project project) {
             super(project);
             setTitle("输入方法签名 — 追溯入口链路");
             init();
