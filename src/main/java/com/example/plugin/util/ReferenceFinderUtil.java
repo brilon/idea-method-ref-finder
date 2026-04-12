@@ -2450,16 +2450,12 @@ public class ReferenceFinderUtil {
             List<ChainResult> chains = new ArrayList<>();
             for (PsiMethod sourceMethod : sourceMethods) {
                 if (indicator != null && indicator.isCanceled()) break;
-                try {
-                    traceUpward(sourceMethod, new ArrayList<>(),
-                            0, maxServiceHops, 0,
-                            new HashSet<>(),
-                            signature, sourceModule,
-                            null, null,
-                            chains, indicator);
-                } catch (com.intellij.openapi.progress.ProcessCanceledException pce) {
-                    break; // stop processing further overloads; return partial chains
-                }
+                traceUpward(sourceMethod, new ArrayList<>(),
+                        0, maxServiceHops, 0,
+                        new HashSet<>(),
+                        signature, sourceModule,
+                        null, null,
+                        chains, indicator);
             }
 
             if (chains.isEmpty()) {

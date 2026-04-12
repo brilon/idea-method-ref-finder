@@ -82,7 +82,7 @@ public class CsvExporter {
         }
     }
 
-    public static String escapeCsv(String value) {
+    private static String escapeCsv(String value) {
         if (value == null) return "";
         if (value.contains(",") || value.contains("\"") || value.contains("\n")) {
             return "\"" + value.replace("\"", "\"\"") + "\"";
