@@ -19,7 +19,6 @@ import com.intellij.psi.search.UsageSearchContext;
 
 import java.nio.charset.StandardCharsets;
 import java.util.*;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -931,7 +930,8 @@ public class ReferenceFinderUtil {
     public static List<String[]> analyzeMethodReferences(
             List<PsiMethod> methods, int chainDepth, ProgressIndicator indicator) {
         List<String[]> results = new ArrayList<>();
-        Map<String, Boolean> deadCache = new HashMap<>();
+        Map<String, Boolean>   deadCache = new HashMap<>();
+        Map<String, MethodRefs> refsCache = new HashMap<>();
 
         for (PsiMethod sourceMethod : methods) {
             String[] sourceInfo = ReadAction.compute(() -> {
@@ -994,7 +994,8 @@ public class ReferenceFinderUtil {
                 String callerSig = ReadAction.compute(() -> getMethodSignature(callerA));
                 boolean isDead = deadCache.computeIfAbsent(
                         callerSig + "|" + chainDepth,
-                        k -> isTransitivelyDead(callerA, chainDepth, new HashSet<>()));
+                        k -> isTransitivelyDead(callerA, chainDepth, new HashSet<>(),
+                                deadCache, refsCache));
                 results.add(new String[]{
                         methodSig,
                         callerSig,
@@ -1019,7 +1020,8 @@ public class ReferenceFinderUtil {
     public static List<String[]> analyzeClassReferences(
             List<PsiClass> classes, int chainDepth, ProgressIndicator indicator) {
         List<String[]> results = new ArrayList<>();
-        Map<String, Boolean> deadCache = new HashMap<>();
+        Map<String, Boolean>    deadCache = new HashMap<>();
+        Map<String, MethodRefs> refsCache = new HashMap<>();
 
         for (PsiClass sourceClass : classes) {
             String qualifiedName = ReadAction.compute(() -> sourceClass.getQualifiedName());
@@ -1069,7 +1071,8 @@ public class ReferenceFinderUtil {
                 String callerSig = ReadAction.compute(() -> getMethodSignature(callerA));
                 boolean isDead = deadCache.computeIfAbsent(
                         callerSig + "|" + chainDepth,
-                        k -> isTransitivelyDead(callerA, chainDepth, new HashSet<>()));
+                        k -> isTransitivelyDead(callerA, chainDepth, new HashSet<>(),
+                                deadCache, refsCache));
                 results.add(new String[]{
                         qualifiedName,
                         callerSig,
@@ -1096,57 +1099,65 @@ public class ReferenceFinderUtil {
      *   <li>任意调用者存活 → {@code false}</li>
      *   <li>循环引用 → {@code false}（保守视为活跃）</li>
      * </ul>
+     *
+     * @param refsCache  方法引用搜索结果缓存（签名 → MethodRefs），跨递归调用共享
+     * @param deadCache  传递性死代码判定结果缓存（签名|深度 → boolean），跨递归调用共享
      */
-    private static boolean isTransitivelyDead(PsiMethod method, int depth, Set<String> visited) {
+    private static boolean isTransitivelyDead(
+            PsiMethod method, int depth, Set<String> visited,
+            Map<String, Boolean> deadCache, Map<String, MethodRefs> refsCache) {
+
         String sig = ReadAction.compute(() -> getMethodSignature(method));
         if (visited.contains(sig)) return false; // 循环引用，保守视为活跃
         visited.add(sig);
 
-        AtomicBoolean hasCallers      = new AtomicBoolean(false);
-        AtomicBoolean foundLiveCaller = new AtomicBoolean(false);
+        // 从缓存获取或执行一次引用搜索，后续对同一方法的查询直接命中缓存
+        MethodRefs refs = refsCache.computeIfAbsent(sig, k -> {
+            List<PsiMethod> callerList = new ArrayList<>();
+            boolean[] hasNonMethod = {false};
+            for (Project project : ProjectManager.getInstance().getOpenProjects()) {
+                if (hasNonMethod[0]) break; // 已确认有活跃引用，无需继续搜索
+                PsiMethod target = ReadAction.compute(() -> {
+                    PsiClass cls = method.getContainingClass();
+                    if (cls == null) return null;
+                    String qName = cls.getQualifiedName();
+                    if (qName == null) return null;
+                    JavaPsiFacade f = JavaPsiFacade.getInstance(project);
+                    PsiClass targetClass = f.findClass(qName, GlobalSearchScope.allScope(project));
+                    return targetClass == null ? null : findMatchingMethod(targetClass, method);
+                });
+                if (target == null) continue;
+                ReferencesSearch.search(target, GlobalSearchScope.projectScope(project))
+                        .forEach(ref -> {
+                            PsiMethod caller = ReadAction.compute(() ->
+                                    PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
+                            if (caller == null) {
+                                hasNonMethod[0] = true; // 非方法体引用 → 活跃
+                            } else {
+                                callerList.add(caller);
+                            }
+                            return !hasNonMethod[0]; // 找到非方法体引用后提前终止遍历
+                        });
+            }
+            return new MethodRefs(callerList, hasNonMethod[0]);
+        });
 
-        for (Project project : ProjectManager.getInstance().getOpenProjects()) {
-            if (foundLiveCaller.get()) break;
+        if (refs.hasNonMethodRef) return false; // 非方法体引用 → 活跃
+        if (refs.callers.isEmpty())  return true;  // 无调用者 → 死代码
+        if (depth <= 0)              return false; // 到达深度上限 → 保守视为活跃
 
-            PsiMethod target = ReadAction.compute(() -> {
-                PsiClass cls = method.getContainingClass();
-                if (cls == null) return null;
-                String qName = cls.getQualifiedName();
-                if (qName == null) return null;
-                JavaPsiFacade f = JavaPsiFacade.getInstance(project);
-                PsiClass targetClass = f.findClass(qName, GlobalSearchScope.allScope(project));
-                return targetClass == null ? null : findMatchingMethod(targetClass, method);
-            });
-            if (target == null) continue;
-
-            ReferencesSearch.search(target, GlobalSearchScope.projectScope(project))
-                    .forEach(ref -> {
-                        if (foundLiveCaller.get()) return false;
-                        hasCallers.set(true);
-
-                        PsiMethod caller = ReadAction.compute(() ->
-                                PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
-
-                        if (caller == null) {
-                            // 字段/注解等非方法体引用 → 活跃
-                            foundLiveCaller.set(true);
-                            return false;
-                        }
-                        if (depth <= 0) {
-                            // 到达深度上限且仍有方法调用者 → 保守视为活跃
-                            foundLiveCaller.set(true);
-                            return false;
-                        }
-                        if (!isTransitivelyDead(caller, depth - 1, new HashSet<>(visited))) {
-                            foundLiveCaller.set(true);
-                            return false;
-                        }
-                        return true;
-                    });
+        // 对每个调用方递归判定，利用 deadCache 避免重复计算
+        for (PsiMethod caller : refs.callers) {
+            String callerSig = ReadAction.compute(() -> getMethodSignature(caller));
+            if (visited.contains(callerSig)) return false; // 循环引用 → 保守视为活跃
+            boolean callerDead = deadCache.computeIfAbsent(
+                    callerSig + "|" + (depth - 1),
+                    k -> isTransitivelyDead(caller, depth - 1,
+                            new HashSet<>(visited), deadCache, refsCache));
+            if (!callerDead) return false;
         }
-
-        // 无调用者（死端） 或 所有调用者均死亡 → 传递性死代码
-        return !foundLiveCaller.get();
+        // 所有调用方均为传递性死代码
+        return true;
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -1215,7 +1226,8 @@ public class ReferenceFinderUtil {
     public static List<String[]> findReferencesWithComments(
             List<PsiMethod> methods, int chainDepth, ProgressIndicator indicator) {
         List<String[]> results = new ArrayList<>();
-        Map<String, String> commentsCache = new HashMap<>();
+        Map<String, String>        commentsCache = new HashMap<>();
+        Map<String, List<PsiMethod>> refsCache   = new HashMap<>();
 
         for (PsiMethod sourceMethod : methods) {
             String[] sourceInfo = ReadAction.compute(() -> {
@@ -1279,7 +1291,8 @@ public class ReferenceFinderUtil {
                                         callerSig + "|" + chainDepth, k -> {
                                             LinkedHashSet<String> commentSet = new LinkedHashSet<>();
                                             collectChainComments(
-                                                    callerMethod, chainDepth, new HashSet<>(), commentSet);
+                                                    callerMethod, chainDepth, new HashSet<>(),
+                                                    commentSet, refsCache);
                                             return String.join(" | ", commentSet);
                                         });
                             }
@@ -1300,7 +1313,8 @@ public class ReferenceFinderUtil {
     public static List<String[]> findClassReferencesWithComments(
             List<PsiClass> classes, int chainDepth, ProgressIndicator indicator) {
         List<String[]> results = new ArrayList<>();
-        Map<String, String> commentsCache = new HashMap<>();
+        Map<String, String>        commentsCache = new HashMap<>();
+        Map<String, List<PsiMethod>> refsCache   = new HashMap<>();
 
         for (PsiClass sourceClass : classes) {
             String qualifiedName = ReadAction.compute(() -> sourceClass.getQualifiedName());
@@ -1348,7 +1362,8 @@ public class ReferenceFinderUtil {
                                         callerSig + "|" + chainDepth, k -> {
                                             LinkedHashSet<String> commentSet = new LinkedHashSet<>();
                                             collectChainComments(
-                                                    callerMethod, chainDepth, new HashSet<>(), commentSet);
+                                                    callerMethod, chainDepth, new HashSet<>(),
+                                                    commentSet, refsCache);
                                             return String.join(" | ", commentSet);
                                         });
                             }
@@ -1368,10 +1383,12 @@ public class ReferenceFinderUtil {
      *   <li>只搜索项目范围（{@code projectScope}），不含外部库</li>
      *   <li>使用共享 {@code visited} 集合避免循环引用和重复计算</li>
      *   <li>注释按首次发现顺序放入 {@code comments}（LinkedHashSet 保序去重）</li>
+     *   <li>{@code refsCache} 缓存引用搜索结果，同一方法的调用方只搜索一次</li>
      * </ul>
      */
     private static void collectChainComments(
-            PsiMethod method, int depth, Set<String> visited, LinkedHashSet<String> comments) {
+            PsiMethod method, int depth, Set<String> visited,
+            LinkedHashSet<String> comments, Map<String, List<PsiMethod>> refsCache) {
         if (depth <= 0) return;
 
         String methodSig = ReadAction.compute(() -> getMethodSignature(method));
@@ -1384,45 +1401,52 @@ public class ReferenceFinderUtil {
             comments.add(comment);
         }
 
-        // 在各项目中查找该方法的调用者，继续向上收集
-        for (Project project : ProjectManager.getInstance().getOpenProjects()) {
-            PsiMethod targetMethod = ReadAction.compute(() -> {
-                PsiClass cls = method.getContainingClass();
-                if (cls == null) return null;
-                String qualifiedName = cls.getQualifiedName();
-                if (qualifiedName == null) return null;
-                JavaPsiFacade facade = JavaPsiFacade.getInstance(project);
-                PsiClass targetClass = facade.findClass(
-                        qualifiedName, GlobalSearchScope.allScope(project));
-                if (targetClass == null) return null;
-                return findMatchingMethod(targetClass, method);
-            });
-            if (targetMethod == null) continue;
+        // 从缓存获取调用方列表；首次未命中时执行搜索并缓存结果
+        List<PsiMethod> callerMethods;
+        if (refsCache.containsKey(methodSig)) {
+            callerMethods = refsCache.get(methodSig);
+        } else {
+            callerMethods = new ArrayList<>();
+            for (Project project : ProjectManager.getInstance().getOpenProjects()) {
+                PsiMethod targetMethod = ReadAction.compute(() -> {
+                    PsiClass cls = method.getContainingClass();
+                    if (cls == null) return null;
+                    String qualifiedName = cls.getQualifiedName();
+                    if (qualifiedName == null) return null;
+                    JavaPsiFacade facade = JavaPsiFacade.getInstance(project);
+                    PsiClass targetClass = facade.findClass(
+                            qualifiedName, GlobalSearchScope.allScope(project));
+                    if (targetClass == null) return null;
+                    return findMatchingMethod(targetClass, method);
+                });
+                if (targetMethod == null) continue;
 
-            List<PsiMethod> callerMethods = new ArrayList<>();
-            ReferencesSearch.search(targetMethod, GlobalSearchScope.projectScope(project))
-                    .forEach(ref -> {
-                        PsiMethod callerMethod = ReadAction.compute(() ->
-                                PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
-                        if (callerMethod != null) {
-                            callerMethods.add(callerMethod);
-                        } else {
-                            // 不在方法体内的引用（字段/初始化块）→ 取所在类注释
-                            String classComment = ReadAction.compute(() -> {
-                                PsiClass cls = PsiTreeUtil.getParentOfType(
-                                        ref.getElement(), PsiClass.class);
-                                return cls != null ? getClassComment(cls) : "";
-                            });
-                            if (!classComment.isEmpty()) {
-                                comments.add(classComment);
+                final List<PsiMethod> projectCallers = callerMethods;
+                ReferencesSearch.search(targetMethod, GlobalSearchScope.projectScope(project))
+                        .forEach(ref -> {
+                            PsiMethod callerMethod = ReadAction.compute(() ->
+                                    PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
+                            if (callerMethod != null) {
+                                projectCallers.add(callerMethod);
+                            } else {
+                                // 不在方法体内的引用（字段/初始化块）→ 取所在类注释
+                                String classComment = ReadAction.compute(() -> {
+                                    PsiClass cls = PsiTreeUtil.getParentOfType(
+                                            ref.getElement(), PsiClass.class);
+                                    return cls != null ? getClassComment(cls) : "";
+                                });
+                                if (!classComment.isEmpty()) {
+                                    comments.add(classComment);
+                                }
                             }
-                        }
-                        return true;
-                    });
-
-            for (PsiMethod caller : callerMethods) {
-                collectChainComments(caller, depth - 1, visited, comments);
+                            return true;
+                        });
             }
+            refsCache.put(methodSig, callerMethods);
+        }
+
+        for (PsiMethod caller : callerMethods) {
+            collectChainComments(caller, depth - 1, visited, comments, refsCache);
         }
     }
 
@@ -1448,6 +1472,7 @@ public class ReferenceFinderUtil {
     public static List<String[]> findInputMethodRefsWithAnnotatedComments(
             List<String> signatures, int chainDepth, ProgressIndicator indicator) {
         List<String[]> results = new ArrayList<>();
+        Map<String, List<PsiMethod>> refsCache = new HashMap<>();
 
         for (String rawSig : signatures) {
             String signature = rawSig.trim();
@@ -1518,7 +1543,8 @@ public class ReferenceFinderUtil {
                                 List<String> chainEntries = new ArrayList<>();
                                 if (callerMethod != null) {
                                     collectAnnotatedChainComments(
-                                            callerMethod, 1, chainDepth, new HashSet<>(), chainEntries);
+                                            callerMethod, 1, chainDepth, new HashSet<>(),
+                                            chainEntries, refsCache);
                                 } else {
                                     // 非方法体引用（import / 字段 / 类级别）→ 取所在类注释
                                     String classComment = ReadAction.compute(() -> {
@@ -1551,10 +1577,12 @@ public class ReferenceFinderUtil {
      * @param maxLevel   最大追溯层数
      * @param visited    已访问方法签名集合（避免循环）
      * @param result     收集到的注释条目列表（按追溯顺序追加）
+     * @param refsCache  方法调用方列表缓存，跨递归调用共享以避免重复搜索
      */
     private static void collectAnnotatedChainComments(
             PsiMethod method, int level, int maxLevel,
-            Set<String> visited, List<String> result) {
+            Set<String> visited, List<String> result,
+            Map<String, List<PsiMethod>> refsCache) {
 
         if (level > maxLevel) return;
 
@@ -1569,30 +1597,34 @@ public class ReferenceFinderUtil {
 
         // 若未到上限，继续向上追溯调用方
         if (level < maxLevel) {
-            for (Project project : ProjectManager.getInstance().getOpenProjects()) {
-                PsiMethod target = ReadAction.compute(() -> {
-                    PsiClass cls = method.getContainingClass();
-                    if (cls == null) return null;
-                    String qn = cls.getQualifiedName();
-                    if (qn == null) return null;
-                    PsiClass targetCls = JavaPsiFacade.getInstance(project)
-                            .findClass(qn, GlobalSearchScope.allScope(project));
-                    return targetCls == null ? null : findMatchingMethod(targetCls, method);
-                });
-                if (target == null) continue;
-
-                List<PsiMethod> callers = new ArrayList<>();
-                ReferencesSearch.search(target, GlobalSearchScope.projectScope(project))
-                        .forEach(ref -> {
-                            PsiMethod caller = ReadAction.compute(() ->
-                                    PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
-                            if (caller != null) callers.add(caller);
-                            return true;
-                        });
-
-                for (PsiMethod caller : callers) {
-                    collectAnnotatedChainComments(caller, level + 1, maxLevel, new HashSet<>(visited), result);
+            // 从缓存获取调用方列表；首次未命中时搜索并缓存
+            List<PsiMethod> callers = refsCache.computeIfAbsent(sig, k -> {
+                List<PsiMethod> callerList = new ArrayList<>();
+                for (Project project : ProjectManager.getInstance().getOpenProjects()) {
+                    PsiMethod target = ReadAction.compute(() -> {
+                        PsiClass cls = method.getContainingClass();
+                        if (cls == null) return null;
+                        String qn = cls.getQualifiedName();
+                        if (qn == null) return null;
+                        PsiClass targetCls = JavaPsiFacade.getInstance(project)
+                                .findClass(qn, GlobalSearchScope.allScope(project));
+                        return targetCls == null ? null : findMatchingMethod(targetCls, method);
+                    });
+                    if (target == null) continue;
+                    ReferencesSearch.search(target, GlobalSearchScope.projectScope(project))
+                            .forEach(ref -> {
+                                PsiMethod caller = ReadAction.compute(() ->
+                                        PsiTreeUtil.getParentOfType(ref.getElement(), PsiMethod.class));
+                                if (caller != null) callerList.add(caller);
+                                return true;
+                            });
                 }
+                return callerList;
+            });
+
+            for (PsiMethod caller : callers) {
+                collectAnnotatedChainComments(
+                        caller, level + 1, maxLevel, new HashSet<>(visited), result, refsCache);
             }
         }
     }
@@ -1828,6 +1860,24 @@ public class ReferenceFinderUtil {
         CrossServiceCaller(PsiMethod method, String apiName) {
             this.method = method;
             this.apiName = apiName;
+        }
+    }
+
+    /**
+     * 方法直接引用搜索结果缓存实体。
+     *
+     * <ul>
+     *   <li>{@code callers} — 位于方法体内的调用方列表</li>
+     *   <li>{@code hasNonMethodRef} — 是否存在非方法体引用（字段赋值、注解、静态初始化块等）</li>
+     * </ul>
+     */
+    private static class MethodRefs {
+        final List<PsiMethod> callers;
+        final boolean hasNonMethodRef;
+
+        MethodRefs(List<PsiMethod> callers, boolean hasNonMethodRef) {
+            this.callers = callers;
+            this.hasNonMethodRef = hasNonMethodRef;
         }
     }
 
