@@ -2299,7 +2299,8 @@ public class ReferenceFinderUtil {
             String inputSig, String inputModule,
             String sourceModuleEndpoint, String crossServiceApiName,
             List<ChainResult> results,
-            ProgressIndicator indicator) {
+            ProgressIndicator indicator,
+            Map<String, List<PsiMethod>> callersCache) {
 
         if (indicator != null && indicator.isCanceled()) return;
         if (results.size() >= MAX_CHAINS_PER_INPUT) return;
@@ -2335,8 +2336,9 @@ public class ReferenceFinderUtil {
             return;
         }
 
-        // ── 查找 Java 调用方 ──
-        List<PsiMethod> callers = findAllCallersAcrossProjects(method, indicator);
+        // ── 查找 Java 调用方（结果按签名缓存，避免对同一方法重复 ReferencesSearch）──
+        List<PsiMethod> callers = callersCache.computeIfAbsent(
+                sig, k -> findAllCallersAcrossProjects(method, indicator));
 
         if (callers.isEmpty()) {
             // 无 Java 调用方 → 检查是否为 RestController 端点
@@ -2364,7 +2366,7 @@ public class ReferenceFinderUtil {
                                     new HashSet<>(visited),
                                     inputSig, inputModule,
                                     smEndpoint, apiName,
-                                    results, indicator);
+                                    results, indicator, callersCache);
                         }
                         return;
                     }
@@ -2391,7 +2393,7 @@ public class ReferenceFinderUtil {
                     new HashSet<>(visited),
                     inputSig, inputModule,
                     sourceModuleEndpoint, crossServiceApiName,
-                    results, indicator);
+                    results, indicator, callersCache);
         }
     }
 
@@ -2411,6 +2413,8 @@ public class ReferenceFinderUtil {
         // 收集所有输入方法的链路结果：inputSig → (inputModule, List<ChainResult>)
         Map<String, String> inputModules = new LinkedHashMap<>();
         Map<String, List<ChainResult>> allChains = new LinkedHashMap<>();
+        // 跨签名共享的调用方缓存：方法签名 → 调用方列表（避免对同一方法重复 ReferencesSearch）
+        Map<String, List<PsiMethod>> callersCache = new HashMap<>();
 
         for (String rawSig : signatures) {
             String signature = rawSig.trim();
@@ -2456,7 +2460,7 @@ public class ReferenceFinderUtil {
                         new HashSet<>(),
                         signature, sourceModule,
                         null, null,
-                        chains, indicator);
+                        chains, indicator, callersCache);
             }
 
             if (chains.isEmpty()) {
