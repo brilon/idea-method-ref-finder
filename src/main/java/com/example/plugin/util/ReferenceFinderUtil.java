@@ -1888,9 +1888,10 @@ public class ReferenceFinderUtil {
     /** 单个方法最大展开调用方数量。 */
     private static final int MAX_CALLERS_PER_METHOD = 50;
 
-    /** properties key 正则：restConfig.restMap.{apiname}.requestUrl = ... */
+    /** properties key 正则：restConfig.restMap.{apiname}.requestUrl = ...
+     *  同时兼容 edmRestConfig.restMap.{apiname}.requestUrl = ...（edmRestService.properties） */
     private static final Pattern REST_URL_KEY_PATTERN =
-            Pattern.compile("restConfig\\.restMap\\.([^.]+)\\.requestUrl\\s*=\\s*(.+)");
+            Pattern.compile("(?:edm)?[Rr]estConfig\\.restMap\\.([^.]+)\\.requestUrl\\s*=\\s*(.+)");
 
     /** 从 URL 中提取路径部分（去掉 http(s)://host(:port) 前缀）。 */
     private static final Pattern URL_PATH_PATTERN =
